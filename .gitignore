@@ -27,3 +27,7 @@ debug_*.jpg
 *.tmp
 *~
 .DS_Store
+
+# App runtime files
+geometry_app/uploads/
+geometry_app/results/
