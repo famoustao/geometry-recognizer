@@ -132,24 +132,40 @@ class GeometryRecognizer:
 
             original_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-            # 1. 文字屏蔽
-            logger.info("步骤1/7: 文字屏蔽...")
-            cleaned = self._mask_text_labels(img)
-            gray = cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY)
-            logger.info("  文字屏蔽完成")
+            # 0. 预处理：文字屏蔽 → 二值化 → 骨架化
+            logger.info("步骤0/8: 图像预处理（文字屏蔽 + 二值化 + 骨架化）...")
+            cleaned, gray, binary, skeleton = self._preprocess(img)
+            logger.info("  预处理完成")
 
-            # 2. 线条检测
-            logger.info("步骤2/7: 线条检测...")
-            merged_lines = self._detect_lines(gray, w, h)
+            # 保存调试图
+            debug_dir = os.path.join(self.temp_dir, "debug")
+            os.makedirs(debug_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(debug_dir, "01_binary.png"), binary)
+            cv2.imwrite(os.path.join(debug_dir, "02_skeleton.png"), skeleton)
+            result.debug_images['binary'] = os.path.join(debug_dir, "01_binary.png")
+            result.debug_images['skeleton'] = os.path.join(debug_dir, "02_skeleton.png")
+
+            # 1. 线条检测（使用骨架图增强）
+            logger.info("步骤1/8: 线条检测（Canny + 骨架）...")
+            merged_lines = self._detect_lines(gray, skeleton, w, h)
             logger.info(f"  检测到 {len(merged_lines)} 条线段（去重后）")
 
+            # 2. 圆形检测（新增）
+            logger.info("步骤2/8: 圆形检测...")
+            detected_circles = self._detect_circles(gray, binary, skeleton, w, h)
+            if detected_circles:
+                logger.info(f"  检测到 {len(detected_circles)} 个圆形")
+                result.geo_info['circles'] = detected_circles
+            else:
+                logger.info("  未检测到完整圆形")
+
             # 3. 直线交点分析 → 找三角形顶点
-            logger.info("步骤3/7: 直线交点分析...")
+            logger.info("步骤3/8: 直线交点分析...")
             A, B, C = self._find_triangle_vertices(merged_lines, gray, w, h)
             logger.info(f"  A({A[0]:.0f},{A[1]:.0f}) B({B[0]:.0f},{B[1]:.0f}) C({C[0]:.0f},{C[1]:.0f})")
 
             # 4. 计算几何点
-            logger.info("步骤4/7: 计算几何点...")
+            logger.info("步骤4/8: 计算几何点...")
             O = ((B[0] + C[0]) / 2, (B[1] + C[1]) / 2)
             radius = self._distance(O, B)
             H = self._perpendicular_foot(A, B, C)
@@ -191,10 +207,11 @@ class GeometryRecognizer:
                 'F': F, 'G': G, 'H': H, 'M': M, 'O': O,
             }
             result.key_points = key_points
-            result.geo_info = {'radius': radius}
+            if 'radius' not in result.geo_info:
+                result.geo_info['radius'] = radius
 
             # 5. 验证线段连接
-            logger.info("步骤5/7: 验证线段连接...")
+            logger.info("步骤5/8: 验证线段连接...")
             valid_connections = self._detect_line_connections(
                 original_gray, key_points, merged_lines)
             result.valid_connections = valid_connections
@@ -203,19 +220,24 @@ class GeometryRecognizer:
                 logger.info(f"    {p1}-{p2}: {c:.0f}%")
 
             # 6. 生成 TikZ 代码
-            logger.info("步骤6/7: 生成 TikZ 代码...")
-            result.tex_code = self._generate_latex(key_points, radius, valid_connections)
+            logger.info("步骤6/8: 生成 TikZ 代码...")
+            result.tex_code = self._generate_latex(key_points, radius, valid_connections,
+                                                    detected_circles)
             tex_lines = result.tex_code.count('\n') + 1
             logger.info(f"  TikZ 代码生成完成: {tex_lines} 行")
 
             # 7. 编译预览图
-            logger.info("步骤7/7: 编译 LaTeX 预览图...")
+            logger.info("步骤7/8: 编译 LaTeX 预览图...")
             preview_path = self._compile_to_png(result.tex_code)
             result.preview_image_path = preview_path
             if preview_path and os.path.exists(preview_path):
                 logger.info(f"  预览图生成成功: {preview_path}")
             else:
                 logger.warning("  预览图生成失败（可能缺少 LaTeX 环境）")
+
+            # 8. 保存调试图
+            logger.info("步骤8/8: 保存调试图...")
+            self._draw_debug_image(img, merged_lines, key_points, detected_circles, debug_dir)
 
             result.success = True
             logger.info(f"{'='*50}")
@@ -231,7 +253,77 @@ class GeometryRecognizer:
             return result
 
     # ============================================================
-    # 图像处理
+    # 图像预处理：二值化 + 骨架化
+    # ============================================================
+
+    def _binarize(self, gray):
+        """
+        二值化：Otsu 自适应阈值 + 形态学修复
+        输入灰度图，输出 0/255 二值图（线条为白色）
+        """
+        # Otsu 自适应阈值
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+        # 形态学闭运算修复断线
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_close, iterations=1)
+
+        logger.info(f"  二值化完成: 前景像素 {cv2.countNonZero(binary)} 个")
+        return binary
+
+    def _skeletonize(self, binary):
+        """
+        骨架化：形态学骨架提取（Zhang-Suen 风格细化）
+        输入 0/255 二值图，输出单像素宽度的骨架图
+        """
+        # 归一化到 0/1
+        skel = binary.copy()
+        skel[skel > 0] = 1
+
+        # 用 erode → dilate 差值逐步提取骨架
+        skeleton = np.zeros_like(skel)
+        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+        prev_count = cv2.countNonZero(skel)
+        while True:
+            eroded = cv2.erode(skel, kernel, iterations=1)
+            if cv2.countNonZero(eroded) == 0:
+                # 最后一次像素：直接加入骨架
+                skeleton = cv2.bitwise_or(skeleton, skel)
+                break
+            dilated = cv2.dilate(eroded, kernel, iterations=1)
+            subset = cv2.subtract(skel, dilated)
+            skeleton = cv2.bitwise_or(skeleton, subset)
+            skel = eroded.copy()
+
+            cur_count = cv2.countNonZero(skel)
+            if cur_count == 0 or cur_count == prev_count:
+                break
+            prev_count = cur_count
+
+        skeleton_255 = (skeleton * 255).astype(np.uint8)
+        logger.info(f"  骨架化完成: 骨架像素 {cv2.countNonZero(skeleton_255)} 个")
+        return skeleton_255
+
+    def _preprocess(self, img):
+        """
+        完整预处理管线：文字屏蔽 → 二值化 → 骨架化
+        返回 (cleaned, gray, binary, skeleton)
+        """
+        # 1. 文字屏蔽
+        cleaned = self._mask_text_labels(img)
+        gray = cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY)
+
+        # 2. 二值化
+        binary = self._binarize(gray)
+
+        # 3. 骨架化
+        skeleton = self._skeletonize(binary)
+
+        return cleaned, gray, binary, skeleton
+
+    # ============================================================
+    # 图像处理（原文字屏蔽）
     # ============================================================
 
     def _mask_text_labels(self, img):
@@ -254,9 +346,19 @@ class GeometryRecognizer:
         cleaned[text_mask > 0] = [255, 255, 255]
         return cleaned
 
-    def _detect_lines(self, gray, w, h):
-        """多阈值 Canny + HoughLinesP 检测线段"""
+    # ============================================================
+    # 线段检测（增强版）
+    # ============================================================
+
+    def _detect_lines(self, gray, skeleton, w, h):
+        """
+        多策略线段检测：
+          - 策略1: Canny 边缘 + HoughLinesP（原始灰度图）
+          - 策略2: 骨架图直接 HoughLinesP（更精确）
+        """
         all_lines = []
+
+        # 策略1: Canny 边缘检测
         for low, high in [(20, 80), (25, 120), (30, 150)]:
             edges = cv2.Canny(gray, low, high, apertureSize=3)
             lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=35,
@@ -264,6 +366,14 @@ class GeometryRecognizer:
             if lines is not None:
                 all_lines.extend(lines)
 
+        # 策略2: 骨架图直接检测（线条已经是单像素宽，更精确）
+        if skeleton is not None and cv2.countNonZero(skeleton) > 50:
+            lines = cv2.HoughLinesP(skeleton, 1, np.pi/180, threshold=20,
+                                     minLineLength=15, maxLineGap=5)
+            if lines is not None:
+                all_lines.extend(lines)
+
+        # 合并去重（同方向 + 邻近的线段合并）
         merged_lines = []
         for line in all_lines:
             line = np.array(line).flatten()
@@ -275,7 +385,7 @@ class GeometryRecognizer:
             for i, ml in enumerate(merged_lines):
                 ang_diff = min(abs(angle - ml['angle']), 180 - abs(angle - ml['angle']))
                 mid_dist = self._distance((mid_x, mid_y), ml['mid'])
-                if ang_diff < 15 and mid_dist < 50:
+                if ang_diff < 12 and mid_dist < 40:
                     if length > ml['length']:
                         merged_lines[i] = {'p1': (x1, y1), 'p2': (x2, y2),
                                            'angle': angle, 'mid': (mid_x, mid_y),
@@ -286,7 +396,114 @@ class GeometryRecognizer:
                 merged_lines.append({'p1': (x1, y1), 'p2': (x2, y2),
                                      'angle': angle, 'mid': (mid_x, mid_y),
                                      'length': length})
+
+        # 按长度排序，保留最长的前 30 条
+        merged_lines.sort(key=lambda x: -x['length'])
+        merged_lines = merged_lines[:30]
+
         return merged_lines
+
+    # ============================================================
+    # 圆形检测（新增）
+    # ============================================================
+
+    def _detect_circles(self, gray, binary, skeleton, w, h):
+        """
+        使用 HoughCircles 检测圆形
+        返回 [(cx, cy, r), ...]
+        """
+        # 对灰度图进行高斯模糊减少噪声
+        blurred = cv2.GaussianBlur(gray, (7, 7), 2.0)
+
+        # 多组参数尝试检测
+        raw_candidates = []
+        params_list = [
+            (1.2, 60, 80, 30),   # dp, minDist, param1, param2
+            (1.0, 50, 60, 25),
+            (1.5, 70, 100, 35),
+        ]
+
+        for dp, minDist, param1, param2 in params_list:
+            circles = cv2.HoughCircles(
+                blurred, cv2.HOUGH_GRADIENT,
+                dp=dp, minDist=minDist,
+                param1=param1, param2=param2,
+                minRadius=max(15, min(w, h) // 25),
+                maxRadius=min(w, h) // 3
+            )
+            if circles is not None:
+                circles = np.round(circles[0]).astype("int")
+                for (cx, cy, r) in circles:
+                    raw_candidates.append((cx, cy, r))
+
+        if not raw_candidates:
+            return []
+
+        # 非极大值抑制（NMS）去重
+        raw_candidates.sort(key=lambda x: -x[2])  # 按半径降序
+        nms_results = []
+        for (cx, cy, r) in raw_candidates:
+            is_dup = False
+            for (ex_cx, ex_cy, ex_r) in nms_results:
+                center_dist = math.sqrt((cx - ex_cx)**2 + (cy - ex_cy)**2)
+                radius_diff = abs(r - ex_r)
+                if center_dist < 40 and radius_diff < 20:
+                    is_dup = True
+                    break
+                # 同心圆去重
+                if center_dist < 20 and radius_diff < 50:
+                    is_dup = True
+                    break
+            if not is_dup:
+                nms_results.append((cx, cy, r))
+
+        # 验证：检查圆弧上是否有足够多的黑色像素
+        detected = []
+        for (cx, cy, r) in nms_results:
+            verified = self._verify_circle(binary, skeleton, cx, cy, r)
+            if verified:
+                detected.append((cx, cy, r))
+                logger.info(f"  检测到圆形: 中心({cx},{cy}) 半径{r}")
+
+        # 最多保留 5 个最可信的圆
+        if len(detected) > 5:
+            detected.sort(key=lambda x: -x[2])
+            detected = detected[:5]
+
+        return detected
+
+    def _verify_circle(self, binary, skeleton, cx, cy, r):
+        """验证圆形检测结果：沿圆弧采样，检查骨架像素命中率"""
+        h, w = binary.shape
+        num_samples = max(48, int(r * 0.8))
+        hit_count = 0
+
+        for i in range(num_samples):
+            theta = 2 * math.pi * i / num_samples
+            x = int(cx + r * math.cos(theta))
+            y = int(cy + r * math.sin(theta))
+
+            # 在骨架图上检查半径 ±2px 范围内是否有像素
+            found = False
+            for dr in range(-2, 3):
+                rx = int(cx + (r + dr) * math.cos(theta))
+                ry = int(cy + (r + dr) * math.sin(theta))
+                if 0 <= rx < w and 0 <= ry < h:
+                    # 同时检查骨架和二值图
+                    if skeleton[ry, rx] > 0 or binary[ry, rx] > 0:
+                        hit_count += 1
+                        found = True
+                        break
+                if found:
+                    break
+
+        if num_samples == 0:
+            return False
+
+        # 要求圆弧上至少 50% 的采样点有骨架像素
+        hit_ratio = hit_count / num_samples
+        logger.debug(f"    圆形验证: 中心({cx},{cy}) r={r} 骨架命中率 {hit_ratio:.2f}")
+        return hit_ratio > 0.50
 
     def _cluster_points(self, points, eps=15, min_samples=2):
         """纯 numpy 密度聚类（替代 sklearn DBSCAN，消除 scipy 依赖）"""
@@ -432,8 +649,8 @@ class GeometryRecognizer:
     # TikZ 生成
     # ============================================================
 
-    def _generate_latex(self, kpts, radius, valid_connections=None):
-        """生成 TikZ 代码（检测层 + 构造层）"""
+    def _generate_latex(self, kpts, radius, valid_connections=None, detected_circles=None):
+        """生成 TikZ 代码（检测层 + 构造层 + 圆形）"""
         A = kpts['A']; B = kpts['B']; C = kpts['C']
         D = kpts['D']; E = kpts['E']; F = kpts['F']
         G = kpts['G']; H = kpts['H']; M = kpts['M']; O = kpts['O']
@@ -455,7 +672,7 @@ class GeometryRecognizer:
         def tx(px): return px * scale + offset_x
         def ty(py): return -(py * scale + offset_y)
 
-        # 圆弧角度
+        # 圆弧角度（以BC为直径的半圆）
         otx, oty = tx(O[0]), ty(O[1])
         btx, bty = tx(B[0]), ty(B[1])
         ctx, cty = tx(C[0]), ty(C[1])
@@ -481,6 +698,16 @@ class GeometryRecognizer:
             p = kpts[name]
             lines.append(f"    \\coordinate ({name}) at ({tx(p[0]):.3f}, {ty(p[1]):.3f});")
         lines.append("")
+
+        # 检测到的圆形（如果有）
+        if detected_circles:
+            lines.append("    % === 检测到的圆形 ===")
+            for i, (cx, cy, r) in enumerate(detected_circles):
+                tcx, tcy = tx(cx), ty(cy)
+                tr = r * scale
+                if tr > 0.1:  # 过滤太小的圆
+                    lines.append(f"    \\draw[dashed, thick] ({tcx:.3f}, {tcy:.3f}) circle ({tr:.3f});")
+            lines.append("")
 
         # 半圆
         lines.append("    % === 以BC为直径的半圆 ===")
@@ -661,6 +888,36 @@ class GeometryRecognizer:
                             best_dist = d
                             best_pt = (float(nx), float(ny))
         return best_pt
+
+    def _draw_debug_image(self, img, merged_lines, key_points, detected_circles, debug_dir):
+        """绘制调试图：在原图上标注检测到的线段、顶点和圆形"""
+        debug = img.copy()
+
+        # 画检测到的线段
+        for line in merged_lines:
+            p1, p2 = line['p1'], line['p2']
+            cv2.line(debug,
+                     (int(p1[0]), int(p1[1])),
+                     (int(p2[0]), int(p2[1])),
+                     (0, 255, 0), 2)  # 绿色线段
+
+        # 画检测到的圆形
+        for (cx, cy, r) in detected_circles:
+            cv2.circle(debug, (cx, cy), r, (255, 0, 0), 2)  # 蓝色圆形
+            cv2.circle(debug, (cx, cy), 3, (255, 0, 0), -1)  # 圆心
+
+        # 画关键点
+        for name, pt in key_points.items():
+            if name == 'O':
+                continue
+            x, y = int(pt[0]), int(pt[1])
+            cv2.circle(debug, (x, y), 5, (0, 0, 255), -1)  # 红色实心圆
+            cv2.putText(debug, name, (x+8, y-6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+        debug_path = os.path.join(debug_dir, "03_debug_annotated.png")
+        cv2.imwrite(debug_path, debug)
+        logger.info(f"  调试图已保存: {debug_path}")
 
     def cleanup(self):
         """清理临时文件"""
