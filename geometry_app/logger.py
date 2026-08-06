@@ -1,6 +1,9 @@
 """
 日志系统模块
-支持文件日志 + 控制台日志 + 日志轮转
+- 自动保存到程序目录下的 logs/run_YYYYMMDD.log
+- 支持文件日志 + 控制台日志 + GUI 日志信号
+- 自动识别 EXE 目录（PyInstaller 打包后也能正确保存）
+- 紧急 crash 日志写入程序目录下的 crash_log.txt
 """
 import os
 import sys
@@ -10,8 +13,19 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 
-# 全局日志目录
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
+def get_program_dir():
+    """获取程序所在目录（兼容 PyInstaller EXE 和源码运行）"""
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包后的 EXE
+        return os.path.dirname(sys.executable)
+    else:
+        # 源码运行
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# 程序目录（用户可访问的目录，不是临时目录）
+PROGRAM_DIR = get_program_dir()
+LOG_DIR = os.path.join(PROGRAM_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # 日志级别映射
@@ -96,6 +110,8 @@ def get_logger(name="geometry_recog"):
     gui_handler.setFormatter(gui_fmt)
     logger.addHandler(gui_handler)
 
+    logger.info(f"日志文件: {log_file}")
+    logger.info(f"程序目录: {PROGRAM_DIR}")
     return logger
 
 
@@ -127,3 +143,19 @@ def read_recent_logs(lines=100):
         return [line.rstrip() for line in all_lines[-lines:]]
     except Exception as e:
         return [f"[ERROR] 读取日志失败: {e}"]
+
+
+def write_crash_log(error_message, traceback_str):
+    """紧急写入 crash 日志到程序目录（确保即使崩溃也能找到）"""
+    crash_path = os.path.join(PROGRAM_DIR, "crash_log.txt")
+    try:
+        with open(crash_path, 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"崩溃时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"程序目录: {PROGRAM_DIR}\n")
+            f.write(f"错误: {error_message}\n")
+            f.write(f"堆栈:\n{traceback_str}\n")
+            f.write(f"{'='*60}\n")
+        print(f"[紧急] crash 日志已保存: {crash_path}")
+    except Exception as e:
+        print(f"[紧急] 无法写入 crash 日志: {e}")

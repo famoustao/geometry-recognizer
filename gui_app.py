@@ -37,7 +37,51 @@ from PySide6.QtGui import (
 )
 
 from geometry_app import GeometryRecognizer, RecognitionResult, safe_imread
-from geometry_app.logger import logger, log_exception, get_log_file_path, LogSignal, read_recent_logs
+from geometry_app.logger import logger, log_exception, get_log_file_path, LogSignal, read_recent_logs, write_crash_log, PROGRAM_DIR
+
+
+# ═══════════════════════════════════════════════════════════════
+# 全局异常捕获（防止闪退，自动保存 crash 日志）
+# ═══════════════════════════════════════════════════════════════
+
+def _global_excepthook(exc_type, exc_value, exc_tb):
+    """全局未捕获异常处理——防止闪退，保存日志，弹窗提示"""
+    tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    error_msg = f"{exc_type.__name__}: {exc_value}"
+
+    # 紧急写入 crash_log.txt
+    write_crash_log(error_msg, tb_str)
+
+    # 日志记录
+    try:
+        logger.critical(f"未捕获异常: {error_msg}")
+        for line in tb_str.split('\n'):
+            if line.strip():
+                logger.critical(f"  {line}")
+    except Exception:
+        pass
+
+    # 弹窗提示（如果 QApplication 已存在）
+    try:
+        app = QApplication.instance()
+        if app:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                None, "程序崩溃",
+                f"程序遇到了未预期的错误，即将退出。\n\n"
+                f"错误: {error_msg}\n\n"
+                f"详细日志已保存到:\n{os.path.join(PROGRAM_DIR, 'crash_log.txt')}\n"
+                f"程序目录下的 logs/ 文件夹"
+            )
+    except Exception:
+        pass
+
+    # 调用原始钩子
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+# 注册全局异常钩子
+sys.excepthook = _global_excepthook
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -447,6 +491,18 @@ class MainWindow(QMainWindow):
         log_layout = QVBoxLayout(log_tab)
         log_layout.setContentsMargins(2, 2, 2, 2)
         log_layout.setSpacing(4)
+
+        # 日志路径提示
+        log_path_label = QLabel(
+            f"📁 日志文件: {os.path.join(get_log_file_path())}<br>"
+            f"📁 崩溃日志: {os.path.join(PROGRAM_DIR, 'crash_log.txt')}"
+        )
+        log_path_label.setWordWrap(True)
+        log_path_label.setStyleSheet(
+            "font-size: 10px; color: #888; background: #2a2a2a; "
+            "padding: 4px 8px; border-radius: 3px;"
+        )
+        log_layout.addWidget(log_path_label)
 
         self.log_edit = QPlainTextEdit()
         self.log_edit.setReadOnly(True)
@@ -1168,21 +1224,36 @@ class MainWindow(QMainWindow):
 # ═══════════════════════════════════════════════════════════════
 
 def main():
-    # 高DPI支持
-    QApplication.setHighDpiScaleFactorRoundingPolicy(
-        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-    )
-    app = QApplication(sys.argv)
-    app.setApplicationName("几何图形矢量化识别系统")
+    try:
+        # 高DPI支持
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+        app = QApplication(sys.argv)
+        app.setApplicationName("几何图形矢量化识别系统")
 
-    # 设置全局字体
-    font = QFont("Microsoft YaHei, 'Noto Sans CJK SC', 'PingFang SC', sans-serif", 10)
-    app.setFont(font)
+        # 设置全局字体
+        font = QFont("Microsoft YaHei, 'Noto Sans CJK SC', 'PingFang SC', sans-serif", 10)
+        app.setFont(font)
 
-    window = MainWindow()
-    window.show()
+        # 日志记录启动信息
+        logger.info("程序启动")
+        logger.info(f"Python 版本: {sys.version}")
+        logger.info(f"程序目录: {PROGRAM_DIR}")
+        logger.info(f"日志目录: {os.path.join(PROGRAM_DIR, 'logs')}")
 
-    sys.exit(app.exec())
+        window = MainWindow()
+        window.show()
+
+        # 包裹事件循环，捕获 Qt 事件中的异常
+        exit_code = app.exec()
+        logger.info(f"程序正常退出，退出码: {exit_code}")
+        sys.exit(exit_code)
+    except Exception as e:
+        tb_str = traceback.format_exc()
+        write_crash_log(f"main() 异常: {type(e).__name__}: {e}", tb_str)
+        logger.critical(f"程序启动/运行异常: {e}\n{tb_str}")
+        raise
 
 
 if __name__ == "__main__":
