@@ -46,6 +46,10 @@ jobs:
           pyinstaller --onefile --windowed --name GeometryRecognizer `
             --add-data "geometry_app;geometry_app" `
             --hidden-import "PIL._tkinter_finder" `
+            --hidden-import "geometry_app.recognizer" `
+            --hidden-import "geometry_app.logger" `
+            --hidden-import "geometry_app.detikzify_backend" `
+            --collect-submodules "geometry_app" `
             --icon NONE `
             gui_app.py
         shell: pwsh
@@ -91,6 +95,10 @@ jobs:
         run: |
           pyinstaller --onefile --windowed --name GeometryRecognizer \
             --add-data "geometry_app:geometry_app" \
+            --hidden-import "geometry_app.recognizer" \
+            --hidden-import "geometry_app.logger" \
+            --hidden-import "geometry_app.detikzify_backend" \
+            --collect-submodules "geometry_app" \
             gui_app.py
 
       - name: 上传 macOS 构建产物

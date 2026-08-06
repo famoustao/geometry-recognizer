@@ -30,13 +30,13 @@ from PySide6.QtCore import (
     QRunnable, QThreadPool, QObject, QRect
 )
 from PySide6.QtGui import (
-    QPixmap, QImage, QFont, QTextCursor, QAction, QIcon,
+    QPixmap, QImage, QFont, QTextCursor, QAction, QActionGroup, QIcon,
     QPalette, QColor, QTextCharFormat, QSyntaxHighlighter,
     QFontDatabase, QClipboard, QPainter, QPen, QBrush, QTransform,
     QPageSize, QPageLayout, QTextBlockFormat
 )
 
-from geometry_app import GeometryRecognizer, RecognitionResult, safe_imread
+from geometry_app import GeometryRecognizer, RecognitionResult, safe_imread, create_recognizer, DETIKZIFY_AVAILABLE
 from geometry_app.logger import logger, log_exception, get_log_file_path, LogSignal, read_recent_logs, write_crash_log, PROGRAM_DIR
 
 
@@ -149,13 +149,14 @@ class RecognizeWorker(QThread):
     finished = Signal(str, object)  # image_path, RecognitionResult
     progress = Signal(str, int)     # message, percent
 
-    def __init__(self, image_path, parent=None):
+    def __init__(self, image_path, backend="cv", parent=None):
         super().__init__(parent)
         self.image_path = image_path
+        self.backend = backend
 
     def run(self):
         try:
-            recognizer = GeometryRecognizer()
+            recognizer = create_recognizer(backend=self.backend)
             self.progress.emit(f"识别中: {os.path.basename(self.image_path)}...", 30)
             result = recognizer.recognize(self.image_path)
             self.progress.emit(f"编译中: {os.path.basename(self.image_path)}...", 80)
@@ -216,8 +217,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("几何图形矢量化识别系统")
-        self.setMinimumSize(1400, 900)
-        self.resize(1600, 1000)
+        self.setMinimumSize(800, 600)   # 允许缩小到最小
+        self.resize(1200, 800)
 
         # ── 数据 ──
         self.image_paths = []           # 所有图片路径
@@ -279,6 +280,31 @@ class MainWindow(QMainWindow):
 
         # 识别
         rec_menu = menubar.addMenu("识别(&R)")
+
+        # 后端选择子菜单
+        backend_menu = rec_menu.addMenu("识别方法")
+        self.backend_group = QActionGroup(self)
+        self.backend_group.setExclusive(True)
+        self.act_backend_cv = QAction("CV 几何算法", self, checkable=True)
+        self.act_backend_cv.setChecked(True)
+        self.act_backend_cv.setData("cv")
+        backend_menu.addAction(self.act_backend_cv)
+        self.backend_group.addAction(self.act_backend_cv)
+
+        if DETIKZIFY_AVAILABLE:
+            self.act_backend_ai = QAction("AI (DeTikZify)", self, checkable=True)
+            self.act_backend_ai.setData("ai")
+            backend_menu.addAction(self.act_backend_ai)
+            self.backend_group.addAction(self.act_backend_ai)
+
+        self.act_backend_auto = QAction("自动 (AI优先)", self, checkable=True)
+        self.act_backend_auto.setData("auto")
+        backend_menu.addAction(self.act_backend_auto)
+        self.backend_group.addAction(self.act_backend_auto)
+
+        self.backend_group.triggered.connect(self._on_backend_menu_changed)
+
+        rec_menu.addSeparator()
         act_rec_cur = QAction("识别当前图片", self)
         act_rec_cur.setShortcut("F5")
         act_rec_cur.triggered.connect(self._on_recognize_current)
@@ -383,6 +409,28 @@ class MainWindow(QMainWindow):
         self.btn_merge.clicked.connect(self._on_merge_export)
         batch_layout.addWidget(self.btn_merge)
         layout.addWidget(batch_group)
+
+        # 识别方法选择
+        method_group = QGroupBox("识别方法")
+        method_layout = QVBoxLayout(method_group)
+        self.backend_combo = QComboBox()
+        self.backend_combo.addItem("CV 几何算法", "cv")
+        if DETIKZIFY_AVAILABLE:
+            self.backend_combo.addItem("AI (DeTikZify)", "ai")
+        self.backend_combo.addItem("自动 (AI优先)", "auto")
+        self.backend_combo.currentIndexChanged.connect(self._on_backend_changed)
+        method_layout.addWidget(self.backend_combo)
+
+        backend_status = QLabel("就绪")
+        backend_status.setStyleSheet("font-size: 10px; color: #666;")
+        if DETIKZIFY_AVAILABLE:
+            backend_status.setText("✓ AI 后端可用")
+            backend_status.setStyleSheet("font-size: 10px; color: #4CAF50;")
+        else:
+            backend_status.setText("AI 后端未安装 (可选)")
+            backend_status.setStyleSheet("font-size: 10px; color: #999;")
+        method_layout.addWidget(backend_status)
+        layout.addWidget(method_group)
 
         return panel
 
@@ -882,12 +930,37 @@ class MainWindow(QMainWindow):
         for path in pending:
             self._start_recognize(path)
 
+    def _get_current_backend(self):
+        """获取当前选中的识别后端"""
+        return self.backend_combo.currentData()
+
+    def _on_backend_changed(self, index):
+        """下拉框后端选择变更"""
+        backend = self.backend_combo.itemData(index)
+        logger.info(f"识别方法切换为: {backend}")
+        # 同步菜单选择
+        for act in self.backend_group.actions():
+            if act.data() == backend:
+                act.setChecked(True)
+                break
+
+    def _on_backend_menu_changed(self, action):
+        """菜单后端选择变更"""
+        backend = action.data()
+        logger.info(f"识别方法切换为: {backend}")
+        # 同步下拉框选择
+        for i in range(self.backend_combo.count()):
+            if self.backend_combo.itemData(i) == backend:
+                self.backend_combo.setCurrentIndex(i)
+                break
+
     def _start_recognize(self, path):
         if path in self.recognizer_pool:
             logger.debug(f"图片已在识别中，跳过: {path}")
             return  # 已在识别中
 
-        logger.info(f"启动识别线程: {path}")
+        backend = self._get_current_backend()
+        logger.info(f"启动识别线程: {path} (后端: {backend})")
 
         # 更新列表状态
         item = self._find_item_by_path(path)
@@ -895,7 +968,7 @@ class MainWindow(QMainWindow):
             item.set_status("processing")
 
         # 启动线程
-        worker = RecognizeWorker(path)
+        worker = RecognizeWorker(path, backend=backend)
         worker.finished.connect(self._on_recognize_finished)
         worker.progress.connect(self._on_recognize_progress)
         self.recognizer_pool[path] = worker
@@ -1135,15 +1208,17 @@ class MainWindow(QMainWindow):
     # ────────────────────────────────────────────────────
 
     def _on_about(self):
+        ai_status = "✓ AI 后端已安装" if DETIKZIFY_AVAILABLE else "AI 后端未安装 (可选)"
         QMessageBox.about(self, "关于",
             "几何图形矢量化识别系统\n\n"
             "基于多特征融合的手绘几何图形矢量化识别算法\n\n"
             "功能：\n"
-            "  • 手绘几何图形识别\n"
+            "  • 手绘几何图形识别 (CV 几何算法)\n"
+            "  • AI 智能识别 (DeTikZify 多模态大模型)\n"
             "  • 自动生成 TikZ 代码\n"
-            "  • 批量处理\n"
-            "  • 合并导出\n\n"
-            "技术栈: Python + OpenCV + PySide6 + LaTeX"
+            "  • 批量处理 / 合并导出\n\n"
+            f"识别后端: {ai_status}\n\n"
+            "技术栈: Python + OpenCV + PySide6 + LaTeX + DeTikZify"
         )
 
     # ────────────────────────────────────────────────────

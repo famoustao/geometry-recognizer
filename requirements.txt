@@ -2,4 +2,14 @@ numpy>=1.21.0
 opencv-python>=4.5.0
 PySide6>=6.5.0
 Pillow>=9.0.0
+
+# ── 打包工具（仅开发/构建时需要）──
 pyinstaller>=5.0.0
+
+# ── AI 识别后端（可选，安装后可使用 DeTikZify 多模态大模型识别）──
+# 安装前需要先安装 PyTorch（参见 pytorch.org）
+# pip install torch>=2.0.0 transformers>=4.30.0 accelerate>=0.20.0
+# 然后安装 DeTikZify:
+# pip install 'detikzify @ git+https://github.com/potamides/DeTikZify'
+#
+# 注意: AI 模型约 16GB，需要 GPU 显存 16GB+ 或使用 CPU 推理（较慢）
