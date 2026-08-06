@@ -252,6 +252,8 @@ def create_recognizer(backend="auto", **kwargs):
         - "cv"   : 强制使用 CV 几何算法
         - "ai"   : 强制使用 AI（DeTikZify），不可用时抛异常
       **kwargs: 传递给具体识别器的参数
+        circle_pixel_tolerance: 圆形像素搜索半径（默认 2）
+        circle_hit_threshold: 圆形命中率阈值（默认 0.50）
 
     返回:
       GeometryRecognizer 或 DeTikZifyRecognizer 实例

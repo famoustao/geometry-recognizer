@@ -11,6 +11,7 @@ import tempfile
 import shutil
 import subprocess
 import gc
+import traceback
 from datetime import datetime
 
 # ── 确保 geometry_app 可导入 ──
@@ -23,7 +24,7 @@ from PySide6.QtWidgets import (
     QStatusBar, QMenuBar, QMenu, QMenuBar, QToolBar, QComboBox,
     QDialog, QDialogButtonBox, QProgressBar, QFrame, QScrollArea,
     QGroupBox, QGridLayout, QButtonGroup, QRadioButton, QSizePolicy,
-    QAbstractItemView, QStyle, QApplication as QA
+    QAbstractItemView, QStyle, QApplication as QA, QSlider
 )
 from PySide6.QtCore import (
     Qt, QThread, Signal, QSize, QTimer, QMutex, QMutexLocker,
@@ -149,21 +150,27 @@ class RecognizeWorker(QThread):
     finished = Signal(str, object)  # image_path, RecognitionResult
     progress = Signal(str, int)     # message, percent
 
-    def __init__(self, image_path, backend="cv", parent=None):
+    def __init__(self, image_path, backend="cv", parent=None,
+                 circle_pixel_tolerance=2, circle_hit_threshold=0.50):
         super().__init__(parent)
         self.image_path = image_path
         self.backend = backend
+        self.circle_pixel_tolerance = circle_pixel_tolerance
+        self.circle_hit_threshold = circle_hit_threshold
 
     def run(self):
         try:
-            recognizer = create_recognizer(backend=self.backend)
+            recognizer = create_recognizer(
+                backend=self.backend,
+                circle_pixel_tolerance=self.circle_pixel_tolerance,
+                circle_hit_threshold=self.circle_hit_threshold,
+            )
             self.progress.emit(f"识别中: {os.path.basename(self.image_path)}...", 30)
             result = recognizer.recognize(self.image_path)
             self.progress.emit(f"编译中: {os.path.basename(self.image_path)}...", 80)
             recognizer.cleanup()
             self.finished.emit(self.image_path, result)
         except Exception as e:
-            import traceback
             result = RecognitionResult()
             result.error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
             self.finished.emit(self.image_path, result)
@@ -431,6 +438,65 @@ class MainWindow(QMainWindow):
             backend_status.setStyleSheet("font-size: 10px; color: #999;")
         method_layout.addWidget(backend_status)
         layout.addWidget(method_group)
+
+        # ── 圆形检测参数滑块 ──
+        circle_group = QGroupBox("⚪ 圆形检测参数")
+        circle_layout = QVBoxLayout(circle_group)
+        circle_layout.setSpacing(2)
+
+        # 像素搜索半径
+        tol_layout = QHBoxLayout()
+        tol_label = QLabel("像素搜索半径:")
+        tol_label.setStyleSheet("font-size: 10px;")
+        tol_layout.addWidget(tol_label)
+        self.tol_slider = QSlider(Qt.Horizontal)
+        self.tol_slider.setRange(1, 10)
+        self.tol_slider.setValue(2)
+        self.tol_slider.setTickPosition(QSlider.TicksBelow)
+        self.tol_slider.setTickInterval(1)
+        self.tol_slider.valueChanged.connect(self._on_tol_changed)
+        tol_layout.addWidget(self.tol_slider, 1)
+        self.tol_value_label = QLabel("2px")
+        self.tol_value_label.setFixedWidth(40)
+        self.tol_value_label.setStyleSheet("font-size: 10px; font-weight: bold; color: #1565C0;")
+        tol_layout.addWidget(self.tol_value_label)
+        circle_layout.addLayout(tol_layout)
+
+        self.tol_hint_label = QLabel("建议: 标准打印图形 (2px)")
+        self.tol_hint_label.setStyleSheet("font-size: 9px; color: #888; padding-left: 4px;")
+        self.tol_hint_label.setWordWrap(True)
+        circle_layout.addWidget(self.tol_hint_label)
+
+        # 命中率阈值
+        hit_layout = QHBoxLayout()
+        hit_label = QLabel("命中率阈值:")
+        hit_label.setStyleSheet("font-size: 10px;")
+        hit_layout.addWidget(hit_label)
+        self.hit_slider = QSlider(Qt.Horizontal)
+        self.hit_slider.setRange(10, 100)
+        self.hit_slider.setValue(50)
+        self.hit_slider.setTickPosition(QSlider.TicksBelow)
+        self.hit_slider.setTickInterval(10)
+        self.hit_slider.valueChanged.connect(self._on_hit_changed)
+        hit_layout.addWidget(self.hit_slider, 1)
+        self.hit_value_label = QLabel("0.50")
+        self.hit_value_label.setFixedWidth(40)
+        self.hit_value_label.setStyleSheet("font-size: 10px; font-weight: bold; color: #E65100;")
+        hit_layout.addWidget(self.hit_value_label)
+        circle_layout.addLayout(hit_layout)
+
+        self.hit_hint_label = QLabel("建议: 中等（均衡） (0.50)")
+        self.hit_hint_label.setStyleSheet("font-size: 9px; color: #888; padding-left: 4px;")
+        self.hit_hint_label.setWordWrap(True)
+        circle_layout.addWidget(self.hit_hint_label)
+
+        circle_layout.addSpacing(2)
+        reset_btn = QPushButton("恢复默认 (2px / 0.50)")
+        reset_btn.setStyleSheet("font-size: 9px; padding: 2px 8px;")
+        reset_btn.clicked.connect(self._on_reset_circle_params)
+        circle_layout.addWidget(reset_btn)
+
+        layout.addWidget(circle_group)
 
         return panel
 
@@ -967,8 +1033,17 @@ class MainWindow(QMainWindow):
         if item:
             item.set_status("processing")
 
+        # 读取滑块参数
+        tol = self.tol_slider.value()
+        hit = self.hit_slider.value() / 100.0
+        logger.info(f"  圆形检测参数: 像素搜索半径={tol}px, 命中率阈值={hit:.2f}")
+
         # 启动线程
-        worker = RecognizeWorker(path, backend=backend)
+        worker = RecognizeWorker(
+            path, backend=backend,
+            circle_pixel_tolerance=tol,
+            circle_hit_threshold=hit,
+        )
         worker.finished.connect(self._on_recognize_finished)
         worker.progress.connect(self._on_recognize_progress)
         self.recognizer_pool[path] = worker
@@ -1220,6 +1295,77 @@ class MainWindow(QMainWindow):
             f"识别后端: {ai_status}\n\n"
             "技术栈: Python + OpenCV + PySide6 + LaTeX + DeTikZify"
         )
+
+    # ────────────────────────────────────────────────────
+    # 圆形检测参数滑块回调
+    # ────────────────────────────────────────────────────
+
+    def _on_tol_changed(self, value):
+        """像素搜索半径滑块变化"""
+        self.tol_value_label.setText(f"{value}px")
+        hint_text = self._get_tol_hint(value)
+        self.tol_hint_label.setText(f"建议: {hint_text} ({value}px)")
+        # 颜色渐变提示
+        if value <= 2:
+            self.tol_hint_label.setStyleSheet("font-size: 9px; color: #4CAF50; padding-left: 4px;")
+        elif value <= 4:
+            self.tol_hint_label.setStyleSheet("font-size: 9px; color: #FF9800; padding-left: 4px;")
+        else:
+            self.tol_hint_label.setStyleSheet("font-size: 9px; color: #F44336; padding-left: 4px;")
+        logger.debug(f"像素搜索半径调整为: {value}px ({hint_text})")
+
+    def _get_tol_hint(self, value):
+        """根据像素搜索半径值返回建议文本"""
+        if value <= 1:
+            return "精确图形/扫描图"
+        elif value <= 2:
+            return "标准打印图形"
+        elif value <= 3:
+            return "手绘图形"
+        elif value <= 5:
+            return "粗糙手绘图"
+        else:
+            return "严重失真/模糊图"
+
+    def _on_hit_changed(self, value):
+        """命中率阈值滑块变化"""
+        val = value / 100.0
+        self.hit_value_label.setText(f"{val:.2f}")
+        hint_text = self._get_hit_hint(val)
+        self.hit_hint_label.setText(f"建议: {hint_text} ({val:.2f})")
+        # 颜色渐变提示
+        if val >= 0.50:
+            self.hit_hint_label.setStyleSheet("font-size: 9px; color: #4CAF50; padding-left: 4px;")
+        elif val >= 0.30:
+            self.hit_hint_label.setStyleSheet("font-size: 9px; color: #FF9800; padding-left: 4px;")
+        else:
+            self.hit_hint_label.setStyleSheet("font-size: 9px; color: #F44336; padding-left: 4px;")
+        logger.debug(f"命中率阈值调整为: {val:.2f} ({hint_text})")
+
+    def _get_hit_hint(self, value):
+        """根据命中率阈值返回建议文本"""
+        if value < 0.20:
+            return "宽松检测（易误检）"
+        elif value < 0.30:
+            return "低阈值（适合手绘粗略圆）"
+        elif value < 0.40:
+            return "中等偏低（适合手绘圆）"
+        elif value < 0.50:
+            return "中等（均衡）"
+        elif value < 0.60:
+            return "较高（适合精确圆）"
+        elif value < 0.80:
+            return "严格（仅精确图形）"
+        else:
+            return "极严格（仅完美圆形）"
+
+    def _on_reset_circle_params(self):
+        """恢复圆形检测参数为默认值"""
+        self.tol_slider.setValue(2)
+        self.hit_slider.setValue(50)
+        self.tol_value_label.setText("2px")
+        self.hit_value_label.setText("0.50")
+        logger.info("圆形检测参数已恢复默认: 像素搜索半径=2px, 命中率阈值=0.50")
 
     # ────────────────────────────────────────────────────
     # 析构

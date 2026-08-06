@@ -91,10 +91,13 @@ class RecognitionResult:
 class GeometryRecognizer:
     """几何图形识别引擎"""
 
-    def __init__(self):
+    def __init__(self, circle_pixel_tolerance=2, circle_hit_threshold=0.50):
         self.temp_dir = tempfile.mkdtemp(prefix="geo_recog_")
         self._setup_geometry_constraints()
+        self.circle_pixel_tolerance = circle_pixel_tolerance  # 像素搜索半径 ±N px
+        self.circle_hit_threshold = circle_hit_threshold      # 命中率阈值 0.0~1.0
         logger.info(f"GeometryRecognizer 初始化完成，临时目录: {self.temp_dir}")
+        logger.info(f"  圆形检测参数: 像素容差={self.circle_pixel_tolerance}px, 命中率阈值={self.circle_hit_threshold:.2f}")
 
     def _setup_geometry_constraints(self):
         """几何约束表：每个点只连接几何定义中的相邻点"""
@@ -110,14 +113,23 @@ class GeometryRecognizer:
             'M': {'D', 'G', 'E', 'F'},
         }
 
-    def recognize(self, image_path):
-        """执行完整识别流程，返回 RecognitionResult"""
+    def recognize(self, image_path, circle_pixel_tolerance=None, circle_hit_threshold=None):
+        """执行完整识别流程，返回 RecognitionResult
+        circle_pixel_tolerance: 覆盖实例的圆形像素搜索半径（可选）
+        circle_hit_threshold: 覆盖实例的圆形命中率阈值（可选）
+        """
         result = RecognitionResult()
         result.image_path = image_path
 
         try:
             logger.info(f"{'='*50}")
             logger.info(f"开始识别: {image_path}")
+
+            # 可选参数覆盖实例变量
+            if circle_pixel_tolerance is not None:
+                self.circle_pixel_tolerance = circle_pixel_tolerance
+            if circle_hit_threshold is not None:
+                self.circle_hit_threshold = circle_hit_threshold
 
             img = safe_imread(image_path)
             if img is None:
@@ -477,15 +489,16 @@ class GeometryRecognizer:
         h, w = binary.shape
         num_samples = max(48, int(r * 0.8))
         hit_count = 0
+        tol = self.circle_pixel_tolerance  # 用户可调的像素搜索半径
 
         for i in range(num_samples):
             theta = 2 * math.pi * i / num_samples
             x = int(cx + r * math.cos(theta))
             y = int(cy + r * math.sin(theta))
 
-            # 在骨架图上检查半径 ±2px 范围内是否有像素
+            # 在骨架图上检查半径 ±tol px 范围内是否有像素
             found = False
-            for dr in range(-2, 3):
+            for dr in range(-tol, tol + 1):
                 rx = int(cx + (r + dr) * math.cos(theta))
                 ry = int(cy + (r + dr) * math.sin(theta))
                 if 0 <= rx < w and 0 <= ry < h:
@@ -500,10 +513,9 @@ class GeometryRecognizer:
         if num_samples == 0:
             return False
 
-        # 要求圆弧上至少 50% 的采样点有骨架像素
         hit_ratio = hit_count / num_samples
-        logger.debug(f"    圆形验证: 中心({cx},{cy}) r={r} 骨架命中率 {hit_ratio:.2f}")
-        return hit_ratio > 0.50
+        logger.debug(f"    圆形验证: 中心({cx},{cy}) r={r} 骨架命中率 {hit_ratio:.2f} (容差={tol}px, 阈值={self.circle_hit_threshold:.2f})")
+        return hit_ratio > self.circle_hit_threshold
 
     def _cluster_points(self, points, eps=15, min_samples=2):
         """纯 numpy 密度聚类（替代 sklearn DBSCAN，消除 scipy 依赖）"""
