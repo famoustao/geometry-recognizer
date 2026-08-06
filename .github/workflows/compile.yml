@@ -5,6 +5,8 @@ on:
     branches: [ main ]
     paths:
       - 'run_uploaded_v4.py'
+      - 'gui_app.py'
+      - 'geometry_app/**'
       - 'geometry_recognizer/**'
       - 'uploaded_geometry.jpeg'
   workflow_dispatch:
