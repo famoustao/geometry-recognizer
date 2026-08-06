@@ -1,0 +1,37 @@
+name: 自动编译识别结果
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'run_uploaded_v4.py'
+      - 'geometry_recognizer/**'
+      - 'uploaded_geometry.jpeg'
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y texlive-latex-base texlive-latex-extra texlive-pictures poppler-utils
+
+      - name: 安装Python依赖
+        run: |
+          pip install --break-system-packages opencv-python-headless scikit-learn pillow numpy
+
+      - name: 运行识别算法
+        run: python run_uploaded_v4.py
+
+      - name: 上传结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: recognition-result
+          path: |
+            uploaded_v4.tex
+            uploaded_v4_final.png
+            debug4_*.png
