@@ -1,0 +1,43 @@
+name: 定期清理旧Action记录
+
+on:
+  schedule:
+    # 每周日凌晨 3:00 执行清理
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 清理旧 Workflow 运行记录
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 删除超过 30 天的 workflow runs
+          echo "=== 清理超过 30 天的 workflow runs ==="
+          gh api repos/${{ github.repository }}/actions/runs --paginate \
+            --jq '.workflow_runs[] | select(.created_at < (now - 30*86400 | strftime("%Y-%m-%dT%H:%M:%SZ"))) | .id' \
+            | while read -r run_id; do
+              echo "删除 run #$run_id"
+              gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$run_id" --silent
+            done
+
+      - name: 清理旧 Artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 保留最近 5 个 artifacts，删除其余
+          echo "=== 清理旧 artifacts ==="
+          gh api repos/${{ github.repository }}/actions/artifacts --paginate \
+            --jq '.artifacts | sort_by(.created_at) | reverse | .[5:] | .[].id' \
+            | while read -r artifact_id; do
+              echo "删除 artifact #$artifact_id"
+              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$artifact_id" --silent
+            done
+
+      - name: 完成
+        run: echo "清理完成"

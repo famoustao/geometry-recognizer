@@ -9,6 +9,10 @@ on:
       - 'uploaded_geometry.jpeg'
   workflow_dispatch:
 
+# 保留最近 30 个 runs，清理旧的
+permissions:
+  actions: write
+
 jobs:
   compile:
     runs-on: ubuntu-latest

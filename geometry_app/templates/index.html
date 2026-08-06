@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>几何识别 - 批量处理工具</title>
+<style>
+:root { --primary: #4f46e5; --primary-hover: #4338ca; --bg: #f8fafc; --card: #fff; --border: #e2e8f0; --text: #1e293b; --text-muted: #64748b; --success: #22c55e; --error: #ef4444; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+.header { background: linear-gradient(135deg, #4f46e5, #7c3aed); color: #fff; padding: 24px 40px; }
+.header h1 { font-size: 24px; font-weight: 700; }
+.header p { font-size: 14px; opacity: 0.85; margin-top: 4px; }
+.container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+
+/* Upload Area */
+.upload-zone { border: 2px dashed #c7d2fe; border-radius: 12px; padding: 48px; text-align: center; background: #eef2ff; cursor: pointer; transition: all .2s; }
+.upload-zone:hover, .upload-zone.dragover { border-color: var(--primary); background: #e0e7ff; }
+.upload-zone .icon { font-size: 48px; color: var(--primary); margin-bottom: 12px; }
+.upload-zone h3 { font-size: 18px; margin-bottom: 8px; }
+.upload-zone p { color: var(--text-muted); font-size: 14px; }
+.upload-zone input[type="file"] { display: none; }
+.upload-zone .hint { margin-top: 12px; font-size: 12px; color: var(--text-muted); }
+
+/* Progress */
+.progress-bar { display: none; margin-top: 20px; }
+.progress-bar .bar { height: 8px; background: #e2e8f0; border-radius: 4px; overflow: hidden; }
+.progress-bar .fill { height: 100%; background: linear-gradient(90deg, var(--primary), #7c3aed); border-radius: 4px; transition: width .3s; width: 0; }
+.progress-bar .info { display: flex; justify-content: space-between; margin-top: 8px; font-size: 14px; color: var(--text-muted); }
+
+/* Results Grid */
+.results { margin-top: 24px; display: none; }
+.results h2 { font-size: 18px; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+.results h2 .count { font-size: 14px; color: var(--text-muted); font-weight: 400; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 20px; }
+
+/* Result Card */
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+.card-header { padding: 14px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+.card-header .name { font-weight: 600; font-size: 14px; }
+.card-header .badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: #dcfce7; color: #166534; }
+.card-header .badge.error { background: #fee2e2; color: #991b1b; }
+.card-body { padding: 12px; }
+.card-body img { width: 100%; border-radius: 8px; display: block; }
+.card-body .error-msg { color: var(--error); padding: 20px; text-align: center; }
+
+/* TikZ Code */
+.tikz-section { margin-top: 12px; }
+.tikz-section .label { font-size: 12px; color: var(--text-muted); margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }
+.tikz-section .label .actions { display: flex; gap: 6px; }
+.tikz-section textarea { width: 100%; height: 120px; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 11px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; resize: vertical; background: #f1f5f9; color: #334155; tab-size: 2; }
+.tikz-section textarea:focus { outline: none; border-color: var(--primary); }
+
+/* Buttons */
+.btn { display: inline-flex; align-items: center; gap: 4px; padding: 6px 12px; border-radius: 6px; font-size: 12px; font-weight: 500; cursor: pointer; border: 1px solid var(--border); background: #fff; color: var(--text); transition: all .15s; }
+.btn:hover { background: #f1f5f9; }
+.btn-primary { background: var(--primary); color: #fff; border-color: var(--primary); }
+.btn-primary:hover { background: var(--primary-hover); }
+.btn-sm { padding: 4px 8px; font-size: 11px; }
+.btn-success { background: var(--success); color: #fff; border-color: var(--success); }
+.btn-success:hover { background: #16a34a; }
+.btn-group { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
+.copy-toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #1e293b; color: #fff; padding: 10px 20px; border-radius: 8px; font-size: 14px; opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 999; }
+.copy-toast.show { opacity: 1; }
+
+/* Empty state */
+.empty { text-align: center; padding: 40px; color: var(--text-muted); }
+.empty .icon { font-size: 40px; margin-bottom: 12px; }
+
+/* Responsive */
+@media (max-width: 768px) {
+  .header { padding: 16px 20px; }
+  .container { padding: 16px; }
+  .grid { grid-template-columns: 1fr; }
+  .upload-zone { padding: 24px; }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>📐 几何识别工具</h1>
+  <p>基于多特征融合的手绘几何图形矢量化识别 · 批量处理</p>
+</div>
+
+<div class="container">
+  <!-- Upload -->
+  <div class="upload-zone" id="uploadZone">
+    <div class="icon">📤</div>
+    <h3>拖拽图片到此处，或点击选择</h3>
+    <p>支持 JPG、PNG、BMP 格式，可批量上传</p>
+    <div class="hint">图片将自动识别为几何图形，生成 TikZ 代码</div>
+    <input type="file" id="fileInput" multiple accept=".jpg,.jpeg,.png,.bmp,.tiff">
+  </div>
+
+  <!-- Progress -->
+  <div class="progress-bar" id="progressBar">
+    <div class="bar"><div class="fill" id="progressFill"></div></div>
+    <div class="info">
+      <span id="progressText">处理中...</span>
+      <span id="progressCount">0 / 0</span>
+    </div>
+  </div>
+
+  <!-- Toolbar -->
+  <div class="btn-group" id="toolbar" style="display:none">
+    <button class="btn btn-success" onclick="exportAll()">📥 合并导出 TeX</button>
+  </div>
+
+  <!-- Results -->
+  <div class="results" id="results">
+    <h2>识别结果 <span class="count" id="resultCount"></span></h2>
+    <div class="grid" id="resultGrid"></div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="copy-toast" id="toast"></div>
+
+<script>
+const uploadZone = document.getElementById('uploadZone');
+const fileInput = document.getElementById('fileInput');
+const progressBar = document.getElementById('progressBar');
+const progressFill = document.getElementById('progressFill');
+const progressText = document.getElementById('progressText');
+const progressCount = document.getElementById('progressCount');
+const results = document.getElementById('results');
+const resultGrid = document.getElementById('resultGrid');
+const resultCount = document.getElementById('resultCount');
+const toolbar = document.getElementById('toolbar');
+
+let currentTaskId = null;
+
+// Drag & Drop
+uploadZone.addEventListener('click', () => fileInput.click());
+uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('dragover'); });
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('dragover'));
+uploadZone.addEventListener('drop', e => {
+  e.preventDefault();
+  uploadZone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files);
+});
+fileInput.addEventListener('change', () => { if (fileInput.files.length) handleFiles(fileInput.files); });
+
+function handleFiles(files) {
+  uploadZone.style.display = 'none';
+  progressBar.style.display = 'block';
+  results.style.display = 'none';
+  resultGrid.innerHTML = '';
+  toolbar.style.display = 'none';
+
+  const formData = new FormData();
+  for (const f of files) formData.append('files', f);
+
+  // Upload
+  fetch('/upload', { method: 'POST', body: formData })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) { showToast(data.error); return; }
+      currentTaskId = data.task_id;
+      pollStatus(data.task_id);
+    });
+}
+
+function pollStatus(taskId) {
+  fetch(`/status/${taskId}`)
+    .then(r => r.json())
+    .then(data => {
+      if (data.status === 'not_found') { showToast('任务未找到'); return; }
+
+      progressFill.style.width = data.progress + '%';
+      progressCount.textContent = `${data.progress}%`;
+
+      if (data.status === 'completed') {
+        progressText.textContent = '处理完成！';
+        renderResults(data.results);
+      } else {
+        progressText.textContent = '处理中...';
+        setTimeout(() => pollStatus(taskId), 500);
+      }
+    });
+}
+
+function renderResults(results) {
+  progressBar.style.display = 'none';
+  results.style.display = 'block';
+  toolbar.style.display = 'flex';
+
+  const success = results.filter(r => r.success);
+  const failed = results.filter(r => r.error);
+  resultCount.textContent = `(${success.length} 成功，${failed.length} 失败)`;
+
+  resultGrid.innerHTML = '';
+  results.forEach((r, idx) => {
+    const card = document.createElement('div');
+    card.className = 'card';
+
+    if (r.error) {
+      card.innerHTML = `
+        <div class="card-header"><span class="name">${r.name || '未知'}</span><span class="badge error">失败</span></div>
+        <div class="card-body"><div class="error-msg">${r.error}</div></div>`;
+    } else {
+      card.innerHTML = `
+        <div class="card-header">
+          <span class="name">${r.name}</span>
+          <span class="badge">${r.detected_lines} 条线段</span>
+        </div>
+        <div class="card-body">
+          <img src="${r.preview}" alt="${r.name}" loading="lazy">
+          <div class="tikz-section">
+            <div class="label">
+              <span>TikZ 代码</span>
+              <div class="actions">
+                <button class="btn btn-sm" onclick="copyTex('${r.result_id}')">📋 复制</button>
+                <button class="btn btn-sm" onclick="exportTex('${r.result_id}')">📥 导出 TeX</button>
+                <button class="btn btn-sm" onclick="exportPng('${r.result_id}')">🖼️ 导出 PNG</button>
+              </div>
+            </div>
+            <textarea id="tex-${r.result_id}" readonly>${escapeHtml(r.tex_content)}</textarea>
+          </div>
+        </div>`;
+    }
+    resultGrid.appendChild(card);
+  });
+}
+
+function copyTex(resultId) {
+  const ta = document.getElementById('tex-' + resultId);
+  if (!ta) return;
+  navigator.clipboard.writeText(ta.value).then(() => {
+    showToast('✅ TikZ 代码已复制到剪贴板');
+  });
+}
+
+function exportTex(resultId) {
+  window.open(`/export/${currentTaskId}?result_id=${resultId}`);
+}
+
+function exportPng(resultId) {
+  window.open(`/export_png/${currentTaskId}?result_id=${resultId}`);
+}
+
+function exportAll() {
+  window.open(`/export_merge/${currentTaskId}`);
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+</script>
+</body>
+</html>
