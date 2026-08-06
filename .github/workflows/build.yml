@@ -10,11 +10,14 @@ on:
   schedule:
     - cron: '0 6 * * 1'  # 每周一早上6点
 
+env:
+  PYTHONUNBUFFERED: 1
+
 jobs:
   build:
     strategy:
       matrix:
-        os: [windows-2022]  # 使用 windows-2022 替代 windows-latest
+        os: [windows-2022]
       fail-fast: false
 
     runs-on: ${{ matrix.os }}
@@ -22,11 +25,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 设置 Python 3.10
+      - name: 设置 Python 3.10 (x86)
+        # 用 32位 Python 可大幅降低内存占用
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          architecture: 'x64'
+          architecture: 'x86'
 
       - name: 安装 Python 依赖
         run: |
@@ -44,36 +48,36 @@ jobs:
           python -c "import numpy as np; print('NumPy OK')"
         shell: pwsh
 
-      - name: 编译为单文件 EXE
+      - name: 编译为单目录 EXE（节省内存）
         run: |
-          pyinstaller --onefile --windowed --name GeometryRecognizer `
+          pyinstaller --onedir --windowed --noconfirm --name GeometryRecognizer `
             --add-data "geometry_app;geometry_app" `
             --hidden-import "PIL._tkinter_finder" `
             --hidden-import "geometry_app.recognizer" `
             --hidden-import "geometry_app.logger" `
             --hidden-import "geometry_app.detikzify_backend" `
             --collect-submodules "geometry_app" `
+            --exclude-module matplotlib `
+            --exclude-module scipy `
+            --exclude-module pandas `
+            --exclude-module PIL.ImageShow `
+            --exclude-module tkinter `
             --icon NONE `
             gui_app.py
         shell: pwsh
 
-      - name: 验证 EXE 大小
+      - name: 打包为 ZIP（便于分发）
         run: |
-          $exe = "dist/GeometryRecognizer.exe"
-          if (Test-Path $exe) {
-            $size = (Get-Item $exe).Length / 1MB
-            Write-Host "EXE 大小: $([math]::Round($size, 2)) MB"
-          } else {
-            Write-Host "EXE 未找到"
-            exit 1
-          }
+          Compress-Archive -Path dist/GeometryRecognizer -DestinationPath dist/GeometryRecognizer-Windows-x86.zip
+          $size = (Get-Item dist/GeometryRecognizer-Windows-x86.zip).Length / 1MB
+          Write-Host "ZIP 大小: $([math]::Round($size, 2)) MB"
         shell: pwsh
 
-      - name: 上传 EXE 作为构建产物
+      - name: 上传 ZIP 构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: GeometryRecognizer-Windows-x64
-          path: dist/GeometryRecognizer.exe
+          name: GeometryRecognizer-Windows-x86
+          path: dist/GeometryRecognizer-Windows-x86.zip
 
   # macOS 版本（独立构建，不依赖 Windows）
   build-mac:
@@ -93,18 +97,29 @@ jobs:
           pip install PySide6 opencv-python pillow numpy
           pip install pyinstaller
 
-      - name: 编译为 macOS APP
+      - name: 编译为 macOS APP（单目录模式）
         run: |
-          pyinstaller --onefile --windowed --name GeometryRecognizer \
+          pyinstaller --onedir --windowed --noconfirm --name GeometryRecognizer \
             --add-data "geometry_app:geometry_app" \
             --hidden-import "geometry_app.recognizer" \
             --hidden-import "geometry_app.logger" \
             --hidden-import "geometry_app.detikzify_backend" \
             --collect-submodules "geometry_app" \
+            --exclude-module matplotlib \
+            --exclude-module scipy \
+            --exclude-module pandas \
+            --exclude-module PIL.ImageShow \
+            --exclude-module tkinter \
             gui_app.py
+
+      - name: 打包为 ZIP
+        run: |
+          ditto -c -k --sequesterRsrc dist/GeometryRecognizer dist/GeometryRecognizer-macOS-x64.zip 2>/dev/null || zip -r dist/GeometryRecognizer-macOS-x64.zip dist/GeometryRecognizer
+          size=$(stat -f%z "dist/GeometryRecognizer-macOS-x64.zip" 2>/dev/null || stat -c%s "dist/GeometryRecognizer-macOS-x64.zip")
+          echo "ZIP 大小: $(echo "scale=2; $size/1048576" | bc) MB"
 
       - name: 上传 macOS 构建产物
         uses: actions/upload-artifact@v4
         with:
           name: GeometryRecognizer-macOS-x64
-          path: dist/GeometryRecognizer
+          path: dist/GeometryRecognizer-macOS-x64.zip
