@@ -288,6 +288,46 @@ class GeometryRecognizer:
                                      'length': length})
         return merged_lines
 
+    def _cluster_points(self, points, eps=15, min_samples=2):
+        """纯 numpy 密度聚类（替代 sklearn DBSCAN，消除 scipy 依赖）"""
+        points = np.array(points)
+        n = len(points)
+        if n == 0:
+            return []
+
+        visited = [False] * n
+        clusters = []
+
+        for i in range(n):
+            if visited[i]:
+                continue
+
+            # BFS 找 eps 邻域内的所有点
+            cluster = [i]
+            visited[i] = True
+            queue = [i]
+
+            while queue:
+                current = queue.pop(0)
+                for j in range(n):
+                    if not visited[j]:
+                        dist = np.sqrt(np.sum((points[current] - points[j]) ** 2))
+                        if dist < eps:
+                            visited[j] = True
+                            cluster.append(j)
+                            queue.append(j)
+
+            if len(cluster) >= min_samples:
+                clusters.append(cluster)
+
+        # 计算每个聚类的中心
+        centroids = []
+        for cluster in clusters:
+            centroid = np.mean(points[cluster], axis=0)
+            centroids.append((float(centroid[0]), float(centroid[1])))
+
+        return centroids
+
     def _find_triangle_vertices(self, merged_lines, gray, w, h):
         """从直线交点中找出三角形顶点 A(顶)、B(左下)、C(右下)"""
         intersections = []
@@ -301,18 +341,7 @@ class GeometryRecognizer:
                         intersections.append(pt)
 
         if len(intersections) > 10:
-            from sklearn.cluster import DBSCAN
-            clustering = DBSCAN(eps=15, min_samples=2).fit(intersections)
-            labels = clustering.labels_
-            clusters = {}
-            for i, label in enumerate(labels):
-                if label == -1: continue
-                clusters.setdefault(label, []).append(intersections[i])
-            cluster_pts = []
-            for label, pts in clusters.items():
-                cx = sum(p[0] for p in pts) / len(pts)
-                cy = sum(p[1] for p in pts) / len(pts)
-                cluster_pts.append((cx, cy))
+            cluster_pts = self._cluster_points(intersections, eps=15, min_samples=2)
         else:
             cluster_pts = intersections
 

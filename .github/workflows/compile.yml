@@ -24,7 +24,8 @@ jobs:
 
       - name: 安装Python依赖
         run: |
-          pip install --break-system-packages opencv-python-headless scikit-learn pillow numpy
+          pip install --break-system-packages -r requirements.txt
+          pip install --break-system-packages opencv-python-headless pillow numpy
 
       - name: 运行识别算法
         run: python run_uploaded_v4.py

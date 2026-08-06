@@ -65,9 +65,6 @@ pip install pyinstaller
 pyinstaller --onefile --windowed --name GeometryRecognizer \
   --add-data "geometry_app;geometry_app" \
   --add-data "geometry_recognizer;geometry_recognizer" \
-  --hidden-import "sklearn.cluster" \
-  --hidden-import "sklearn.metrics" \
-  --hidden-import "sklearn.neighbors" \
   gui_app.py
 ```
 
