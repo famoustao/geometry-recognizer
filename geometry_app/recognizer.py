@@ -11,7 +11,63 @@ import glob
 import gc
 import tempfile
 import shutil
+import traceback
 from PIL import Image
+
+from .logger import logger, log_exception
+
+
+def safe_imread(image_path):
+    """
+    安全读取图片（支持中文路径、特殊字符路径）
+    OpenCV 的 cv2.imread 不支持非 ASCII 路径，用 np.fromfile 绕过
+    """
+    logger.info(f"尝试读取图片: {image_path}")
+    logger.info(f"  文件是否存在: {os.path.exists(image_path)}")
+    logger.info(f"  文件大小: {os.path.getsize(image_path) if os.path.exists(image_path) else 'N/A'} 字节")
+    logger.info(f"  文件路径编码: {type(image_path)}")
+
+    if not os.path.exists(image_path):
+        logger.error(f"  文件不存在: {image_path}")
+        return None
+
+    try:
+        # 方法1: 用 np.fromfile 绕过路径编码问题（兼容中文路径）
+        logger.info("  尝试方法1: np.fromfile + cv2.imdecode")
+        file_bytes = np.fromfile(image_path, dtype=np.uint8)
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        if img is not None:
+            logger.info(f"  方法1成功: {img.shape[1]}x{img.shape[0]}")
+            return img
+        logger.warning("  方法1失败")
+    except Exception as e:
+        logger.warning(f"  方法1异常: {e}")
+
+    try:
+        # 方法2: 直接 cv2.imread
+        logger.info("  尝试方法2: cv2.imread")
+        img = cv2.imread(image_path)
+        if img is not None:
+            logger.info(f"  方法2成功: {img.shape[1]}x{img.shape[0]}")
+            return img
+        logger.warning("  方法2失败")
+    except Exception as e:
+        logger.warning(f"  方法2异常: {e}")
+
+    try:
+        # 方法3: 用 PIL 读取再转 OpenCV
+        logger.info("  尝试方法3: PIL.Image + np.array")
+        pil_img = Image.open(image_path)
+        pil_img = pil_img.convert("RGB")
+        img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        if img is not None:
+            logger.info(f"  方法3成功: {img.shape[1]}x{img.shape[0]}")
+            return img
+    except Exception as e:
+        logger.warning(f"  方法3异常: {e}")
+
+    logger.error(f"  所有方法均失败，无法读取图片: {image_path}")
+    return None
 
 
 class RecognitionResult:
@@ -38,6 +94,7 @@ class GeometryRecognizer:
     def __init__(self):
         self.temp_dir = tempfile.mkdtemp(prefix="geo_recog_")
         self._setup_geometry_constraints()
+        logger.info(f"GeometryRecognizer 初始化完成，临时目录: {self.temp_dir}")
 
     def _setup_geometry_constraints(self):
         """几何约束表：每个点只连接几何定义中的相邻点"""
@@ -59,45 +116,63 @@ class GeometryRecognizer:
         result.image_path = image_path
 
         try:
-            img = cv2.imread(image_path)
+            logger.info(f"{'='*50}")
+            logger.info(f"开始识别: {image_path}")
+
+            img = safe_imread(image_path)
             if img is None:
-                result.error = f"无法读取图片: {image_path}"
+                err_msg = f"无法读取图片: {image_path}"
+                logger.error(err_msg)
+                result.error = err_msg
                 return result
 
             h, w = img.shape[:2]
             result.image_size = (w, h)
+            logger.info(f"图片尺寸: {w}x{h}, 通道数: {img.shape[2]}")
+
             original_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
             # 1. 文字屏蔽
+            logger.info("步骤1/7: 文字屏蔽...")
             cleaned = self._mask_text_labels(img)
             gray = cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY)
+            logger.info("  文字屏蔽完成")
 
             # 2. 线条检测
+            logger.info("步骤2/7: 线条检测...")
             merged_lines = self._detect_lines(gray, w, h)
+            logger.info(f"  检测到 {len(merged_lines)} 条线段（去重后）")
 
             # 3. 直线交点分析 → 找三角形顶点
+            logger.info("步骤3/7: 直线交点分析...")
             A, B, C = self._find_triangle_vertices(merged_lines, gray, w, h)
+            logger.info(f"  A({A[0]:.0f},{A[1]:.0f}) B({B[0]:.0f},{B[1]:.0f}) C({C[0]:.0f},{C[1]:.0f})")
 
             # 4. 计算几何点
+            logger.info("步骤4/7: 计算几何点...")
             O = ((B[0] + C[0]) / 2, (B[1] + C[1]) / 2)
             radius = self._distance(O, B)
             H = self._perpendicular_foot(A, B, C)
+            logger.info(f"  O=({O[0]:.0f},{O[1]:.0f}) R={radius:.0f} H=({H[0]:.0f},{H[1]:.0f})")
 
             D = self._line_circle_intersection(A, B, O, radius)
             if D is None:
                 angle_B = math.atan2(B[1] - O[1], B[0] - O[0])
                 D = (O[0] + radius * math.cos(angle_B - math.pi/4),
                      O[1] - radius * abs(math.sin(angle_B - math.pi/4)))
+                logger.info("  D 使用备选计算")
 
             E = self._line_circle_intersection(A, C, O, radius)
             if E is None:
                 angle_C = math.atan2(C[1] - O[1], C[0] - O[0])
                 E = (O[0] + radius * math.cos(angle_C + math.pi/4),
                      O[1] - radius * abs(math.sin(angle_C + math.pi/4)))
+                logger.info("  E 使用备选计算")
 
             # 微调D、E到最近的黑色像素
             D = self._refine_to_dark_pixel(D, O, radius, gray, w, h)
             E = self._refine_to_dark_pixel(E, O, radius, gray, w, h)
+            logger.info(f"  D=({D[0]:.0f},{D[1]:.0f}) E=({E[0]:.0f},{E[1]:.0f})")
 
             F = self._perpendicular_foot(D, B, C)
             G = self._perpendicular_foot(E, B, C)
@@ -107,6 +182,9 @@ class GeometryRecognizer:
             if M is None:
                 M = (H[0] + (A[0] - H[0]) * 0.35,
                      H[1] + (A[1] - H[1]) * 0.35)
+                logger.info("  M 使用备选计算（DG∥EF）")
+
+            logger.info(f"  F=({F[0]:.0f},{F[1]:.0f}) G=({G[0]:.0f},{G[1]:.0f}) M=({M[0]:.0f},{M[1]:.0f})")
 
             key_points = {
                 'A': A, 'B': B, 'C': C, 'D': D, 'E': E,
@@ -116,23 +194,40 @@ class GeometryRecognizer:
             result.geo_info = {'radius': radius}
 
             # 5. 验证线段连接
+            logger.info("步骤5/7: 验证线段连接...")
             valid_connections = self._detect_line_connections(
                 original_gray, key_points, merged_lines)
             result.valid_connections = valid_connections
+            logger.info(f"  验证通过: {len(valid_connections)} 条")
+            for p1, p2, c in valid_connections:
+                logger.info(f"    {p1}-{p2}: {c:.0f}%")
 
             # 6. 生成 TikZ 代码
+            logger.info("步骤6/7: 生成 TikZ 代码...")
             result.tex_code = self._generate_latex(key_points, radius, valid_connections)
+            tex_lines = result.tex_code.count('\n') + 1
+            logger.info(f"  TikZ 代码生成完成: {tex_lines} 行")
 
             # 7. 编译预览图
+            logger.info("步骤7/7: 编译 LaTeX 预览图...")
             preview_path = self._compile_to_png(result.tex_code)
             result.preview_image_path = preview_path
+            if preview_path and os.path.exists(preview_path):
+                logger.info(f"  预览图生成成功: {preview_path}")
+            else:
+                logger.warning("  预览图生成失败（可能缺少 LaTeX 环境）")
 
             result.success = True
+            logger.info(f"{'='*50}")
+            logger.info(f"识别完成: {image_path}")
             return result
 
         except Exception as e:
             import traceback
-            result.error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+            tb = traceback.format_exc()
+            logger.error(f"识别过程异常: {type(e).__name__}: {str(e)}")
+            logger.error(tb)
+            result.error = f"{type(e).__name__}: {str(e)}\n{tb}"
             return result
 
     # ============================================================

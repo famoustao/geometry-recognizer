@@ -11,6 +11,7 @@ import tempfile
 import shutil
 import subprocess
 import gc
+from datetime import datetime
 
 # ── 确保 geometry_app 可导入 ──
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -32,10 +33,11 @@ from PySide6.QtGui import (
     QPixmap, QImage, QFont, QTextCursor, QAction, QIcon,
     QPalette, QColor, QTextCharFormat, QSyntaxHighlighter,
     QFontDatabase, QClipboard, QPainter, QPen, QBrush, QTransform,
-    QPageSize, QPageLayout
+    QPageSize, QPageLayout, QTextBlockFormat
 )
 
-from geometry_app import GeometryRecognizer, RecognitionResult
+from geometry_app import GeometryRecognizer, RecognitionResult, safe_imread
+from geometry_app.logger import logger, log_exception, get_log_file_path, LogSignal, read_recent_logs
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -192,6 +194,9 @@ class MainWindow(QMainWindow):
         self.compile_timer = QTimer(self)
         self.compile_timer.setSingleShot(True)
         self.compile_timer.timeout.connect(self._update_compile)
+
+        # ── 连接日志系统到 GUI ──
+        LogSignal.add_listener(self._on_log_message)
 
     # ────────────────────────────────────────────────────
     # 菜单栏
@@ -390,11 +395,20 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        title = QLabel("📝 TikZ 代码")
-        title.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px;")
-        layout.addWidget(title)
+        # 使用 TabWidget 切换代码/日志
+        self.right_tabs = QTabWidget()
+        self.right_tabs.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #ccc; border-radius: 4px; }
+            QTabBar::tab { padding: 4px 12px; font-size: 11px; }
+            QTabBar::tab:selected { background: #fff; }
+        """)
 
-        # 代码编辑器
+        # ── Tab 1: TikZ 代码 ──
+        code_tab = QWidget()
+        code_layout = QVBoxLayout(code_tab)
+        code_layout.setContentsMargins(2, 2, 2, 2)
+        code_layout.setSpacing(4)
+
         self.code_edit = QPlainTextEdit()
         self.code_edit.setReadOnly(True)
         self.code_edit.setFont(QFont("Consolas, 'Courier New', monospace", 10))
@@ -404,11 +418,10 @@ class MainWindow(QMainWindow):
             "border: 1px solid #333; border-radius: 4px; padding: 4px;"
         )
         self.highlighter = TikZHighlighter(self.code_edit.document())
-        layout.addWidget(self.code_edit, 1)
+        code_layout.addWidget(self.code_edit, 1)
 
         # 操作按钮
         btn_layout = QHBoxLayout()
-
         self.btn_copy = QPushButton("📋 复制代码")
         self.btn_copy.clicked.connect(self._on_copy_code)
         btn_layout.addWidget(self.btn_copy)
@@ -421,12 +434,48 @@ class MainWindow(QMainWindow):
         self.btn_export_png.clicked.connect(self._on_export_png)
         btn_layout.addWidget(self.btn_export_png)
 
-        layout.addLayout(btn_layout)
+        code_layout.addLayout(btn_layout)
 
-        # 状态标签
         self.code_status = QLabel("就绪")
         self.code_status.setStyleSheet("font-size: 11px; color: #666; padding: 2px;")
-        layout.addWidget(self.code_status)
+        code_layout.addWidget(self.code_status)
+
+        self.right_tabs.addTab(code_tab, "📝 TikZ 代码")
+
+        # ── Tab 2: 运行日志 ──
+        log_tab = QWidget()
+        log_layout = QVBoxLayout(log_tab)
+        log_layout.setContentsMargins(2, 2, 2, 2)
+        log_layout.setSpacing(4)
+
+        self.log_edit = QPlainTextEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setFont(QFont("Consolas, 'Courier New', monospace", 9))
+        self.log_edit.setMaximumBlockCount(5000)
+        self.log_edit.setStyleSheet(
+            "background: #1E1E1E; color: #D4D4D4; "
+            "border: 1px solid #333; border-radius: 4px; padding: 4px;"
+        )
+        log_layout.addWidget(self.log_edit, 1)
+
+        log_btn_layout = QHBoxLayout()
+        self.btn_clear_log = QPushButton("🧹 清空日志")
+        self.btn_clear_log.clicked.connect(self._on_clear_log)
+        log_btn_layout.addWidget(self.btn_clear_log)
+
+        self.btn_open_log = QPushButton("📂 打开日志文件")
+        self.btn_open_log.clicked.connect(self._on_open_log_file)
+        log_btn_layout.addWidget(self.btn_open_log)
+
+        self.btn_refresh_log = QPushButton("🔄 刷新日志")
+        self.btn_refresh_log.clicked.connect(self._on_refresh_log)
+        log_btn_layout.addWidget(self.btn_refresh_log)
+
+        log_layout.addLayout(log_btn_layout)
+
+        self.right_tabs.addTab(log_tab, "📋 运行日志")
+
+        layout.addWidget(self.right_tabs)
 
         return panel
 
@@ -502,19 +551,40 @@ class MainWindow(QMainWindow):
     # ────────────────────────────────────────────────────
 
     def _add_images(self, paths):
+        added = 0
+        skipped = 0
         for path in paths:
+            # 检查文件是否存在
+            if not os.path.exists(path):
+                logger.warning(f"跳过不存在的文件: {path}")
+                continue
+
             ext = os.path.splitext(path)[1].lower()
             if ext not in ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'):
+                logger.warning(f"跳过不支持的文件类型 [{ext}]: {path}")
+                skipped += 1
                 continue
             if path in self.image_paths:
+                logger.debug(f"跳过重复文件: {path}")
+                skipped += 1
                 continue
+
+            # 验证图片是否可读（用 safe_imread 预检）
+            test_img = safe_imread(path)
+            if test_img is None:
+                logger.error(f"图片无法读取，跳过: {path}")
+                skipped += 1
+                continue
+
             self.image_paths.append(path)
             item = QListWidgetItem()
             widget = ImageListItem(path, len(self.image_paths) - 1)
             item.setSizeHint(widget.sizeHint())
             self.list_widget.addItem(item)
             self.list_widget.setItemWidget(item, widget)
+            added += 1
 
+        logger.info(f"添加了 {added} 张图片（跳过 {skipped} 张）")
         self._update_status()
         if self.image_paths and self.current_index < 0:
             self.list_widget.setCurrentRow(0)
@@ -525,19 +595,33 @@ class MainWindow(QMainWindow):
             "图片文件 (*.jpg *.jpeg *.png *.bmp *.tiff *.webp);;所有文件 (*)"
         )
         if paths:
+            logger.info(f"用户选择了 {len(paths)} 个文件")
+            for p in paths[:5]:
+                logger.debug(f"  - {p}")
+            if len(paths) > 5:
+                logger.debug(f"  ... 还有 {len(paths)-5} 个")
             self._add_images(paths)
 
     def _on_open_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "选择文件夹")
         if folder:
+            logger.info(f"打开文件夹: {folder}")
             paths = []
             for ext in ('*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff', '*.webp'):
-                paths.extend(glob.glob(os.path.join(folder, ext)))
-                paths.extend(glob.glob(os.path.join(folder, ext.upper())))
+                found = glob.glob(os.path.join(folder, ext))
+                if found:
+                    logger.debug(f"  找到 {len(found)} 个 {ext} 文件")
+                    paths.extend(found)
+                found = glob.glob(os.path.join(folder, ext.upper()))
+                if found:
+                    logger.debug(f"  找到 {len(found)} 个 {ext.upper()} 文件")
+                    paths.extend(found)
             paths = sorted(set(paths))
+            logger.info(f"文件夹中找到 {len(paths)} 个图片文件")
             if paths:
                 self._add_images(paths)
             else:
+                logger.warning(f"文件夹中没有图片文件: {folder}")
                 QMessageBox.information(self, "提示", "文件夹中没有找到图片文件")
 
     def _on_remove_selected(self):
@@ -590,35 +674,63 @@ class MainWindow(QMainWindow):
         self._update_code(index)
 
     def _show_original(self, path):
-        pixmap = QPixmap(path)
+        logger.info(f"加载原图预览: {path}")
+        logger.info(f"  文件是否存在: {os.path.exists(path)}")
+        logger.info(f"  文件大小: {os.path.getsize(path) if os.path.exists(path) else 'N/A'} 字节")
+
+        # 使用 QImage.fromData 加载（支持中文路径）
+        try:
+            with open(path, 'rb') as f:
+                img_data = f.read()
+            logger.info(f"  读取了 {len(img_data)} 字节")
+            qimg = QImage.fromData(img_data)
+            logger.info(f"  QImage.fromData: {'成功' if not qimg.isNull() else '失败'}")
+            pixmap = QPixmap.fromImage(qimg)
+        except Exception as e:
+            logger.warning(f"QImage.fromData 加载失败: {e}")
+            logger.info("  回退到 QPixmap(path) 直接加载")
+            pixmap = QPixmap(path)
+
         if not pixmap.isNull():
+            logger.info(f"  图片加载成功: {pixmap.width()}x{pixmap.height()}")
             scaled = pixmap.scaled(
                 self.preview_label.size(), Qt.KeepAspectRatio,
                 Qt.SmoothTransformation
             )
             # 在图片上叠加顶点标注
             if path in self.results and self.results[path].success:
-                painter = QPainter(pixmap)
-                pen = QPen(QColor("#FF5722"), 3)
-                painter.setPen(pen)
+                # 使用 Pixmap 绘制标注
                 result = self.results[path]
+                painter = QPainter(scaled)
+                painter.setRenderHint(QPainter.Antialiasing)
+                # 缩放因子
+                sx = scaled.width() / pixmap.width()
+                sy = scaled.height() / pixmap.height()
                 for name, pt in result.key_points.items():
                     if name == 'O':
                         continue
-                    x, y = int(pt[0]), int(pt[1])
-                    painter.drawEllipse(x-4, y-4, 8, 8)
-                    painter.setPen(QPen(QColor("#FF5722"), 1))
-                    painter.drawText(x+6, y-6, name)
+                    x, y = int(pt[0] * sx), int(pt[1] * sy)
+                    # 红色圆点
                     painter.setPen(QPen(QColor("#FF5722"), 3))
+                    painter.setBrush(QBrush(QColor("#FF5722")))
+                    painter.drawEllipse(x-4, y-4, 8, 8)
+                    # 标签
+                    painter.setPen(QPen(QColor("#FF5722"), 1))
+                    font = QFont("sans-serif", 10, QFont.Weight.Bold)
+                    painter.setFont(font)
+                    painter.drawText(x+8, y-6, name)
                 painter.end()
-                scaled = pixmap.scaled(
-                    self.preview_label.size(), Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
-                )
 
             self.preview_label.setPixmap(scaled)
         else:
             self.preview_label.setText("无法加载图片")
+            logger.error(f"QPixmap 加载失败: {path}")
+            logger.info("  尝试用 safe_imread 验证图片是否可读...")
+            img = safe_imread(path)
+            if img is not None:
+                logger.info("  safe_imread 成功，是 Qt 格式兼容问题")
+            else:
+                logger.error("  safe_imread 也失败，图片文件可能已损坏")
 
     def _show_latex_preview(self, path):
         if path in self.results and self.results[path].success:
@@ -702,19 +814,24 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "请先选择一张图片")
             return
         path = self.image_paths[self.current_index]
+        logger.info(f"用户请求识别当前图片: {path}")
         self._start_recognize(path)
 
     def _on_recognize_all(self):
         if not self.image_paths:
             QMessageBox.information(self, "提示", "请先添加图片")
             return
-        for path in self.image_paths:
-            if path not in self.results:
-                self._start_recognize(path)
+        pending = [p for p in self.image_paths if p not in self.results]
+        logger.info(f"用户请求批量识别全部图片: {len(pending)} 张待识别")
+        for path in pending:
+            self._start_recognize(path)
 
     def _start_recognize(self, path):
         if path in self.recognizer_pool:
+            logger.debug(f"图片已在识别中，跳过: {path}")
             return  # 已在识别中
+
+        logger.info(f"启动识别线程: {path}")
 
         # 更新列表状态
         item = self._find_item_by_path(path)
@@ -742,6 +859,12 @@ class MainWindow(QMainWindow):
 
         self.results[image_path] = result
 
+        if result.success:
+            logger.info(f"识别成功: {image_path}")
+        else:
+            logger.error(f"识别失败: {image_path}")
+            logger.error(f"  错误: {result.error[:200]}")
+
         # 更新列表状态
         item = self._find_item_by_path(image_path)
         if item:
@@ -762,6 +885,7 @@ class MainWindow(QMainWindow):
             done = sum(1 for r in self.results.values() if r.success)
             failed = sum(1 for r in self.results.values() if not r.success)
             self.status_label.setText(f"识别完成: {done} 成功, {failed} 失败")
+            logger.info(f"全部识别完成: {done} 成功, {failed} 失败")
 
     def _find_item_by_path(self, path):
         for i in range(self.list_widget.count()):
@@ -969,6 +1093,68 @@ class MainWindow(QMainWindow):
     # ────────────────────────────────────────────────────
     # 析构
     # ────────────────────────────────────────────────────
+
+    # ────────────────────────────────────────────────────
+    # 日志面板
+    # ────────────────────────────────────────────────────
+
+    def _on_log_message(self, level, message):
+        """接收 LogSignal 的日志消息，显示到 GUI 日志面板"""
+        try:
+            color_map = {
+                "DEBUG": "#888888",
+                "INFO": "#D4D4D4",
+                "WARNING": "#FFD700",
+                "ERROR": "#FF6B6B",
+                "CRITICAL": "#FF4444",
+            }
+            color = color_map.get(level, "#D4D4D4")
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            html = f'<span style="color:{color}">[{timestamp}] [{level}] {message}</span><br>'
+            self.log_edit.appendHtml(html)
+            # 自动滚动到底部
+            cursor = self.log_edit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.log_edit.setTextCursor(cursor)
+        except Exception:
+            pass
+
+    def _on_clear_log(self):
+        """清空日志面板"""
+        self.log_edit.clear()
+        logger.info("日志已清空")
+
+    def _on_open_log_file(self):
+        """打开日志文件所在目录"""
+        log_path = get_log_file_path()
+        log_dir = os.path.dirname(log_path)
+        try:
+            if sys.platform == 'win32':
+                os.startfile(log_dir)
+            elif sys.platform == 'darwin':
+                subprocess.run(['open', log_dir], check=False)
+            else:
+                subprocess.run(['xdg-open', log_dir], check=False)
+            logger.info(f"打开日志目录: {log_dir}")
+        except Exception as e:
+            logger.warning(f"打开日志目录失败: {e}")
+
+    def _on_refresh_log(self):
+        """从日志文件重新加载最新日志到面板"""
+        lines = read_recent_logs(200)
+        self.log_edit.clear()
+        for line in lines:
+            # 解析日志级别进行颜色标记
+            if "[ERROR]" in line:
+                level = "ERROR"
+            elif "[WARNING]" in line:
+                level = "WARNING"
+            elif "[INFO]" in line:
+                level = "INFO"
+            else:
+                level = "DEBUG"
+            self._on_log_message(level, line)
+        logger.info(f"已刷新日志面板: {len(lines)} 行")
 
     def closeEvent(self, event):
         # 等待所有识别线程结束
