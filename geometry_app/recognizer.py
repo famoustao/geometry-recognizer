@@ -531,28 +531,48 @@ class GeometryRecognizer:
     # ============================================================
 
     def _compile_to_png(self, tex_code, filename="output"):
-        """编译 TikZ 代码为 PNG 图片"""
+        """编译 TikZ 代码为 PNG 图片（缺少 LaTeX 环境时优雅降级）"""
+        # 检查 pdflatex 是否可用
+        if not self._check_command("pdflatex"):
+            logger.warning("LaTeX (pdflatex) 未安装，跳过 LaTeX 编译")
+            logger.warning("请安装 texlive 或 MiKTeX 以启用 LaTeX 预览功能")
+            return ""
+
         tex_path = os.path.join(self.temp_dir, f"{filename}.tex")
         with open(tex_path, 'w', encoding='utf-8') as f:
             f.write(tex_code)
 
         out_dir = self.temp_dir
-        for i in range(2):
-            subprocess.run(
-                ['pdflatex', '-interaction=nonstopmode',
-                 f'-output-directory={out_dir}', tex_path],
-                capture_output=True, text=True, timeout=30
-            )
+        try:
+            for i in range(2):
+                subprocess.run(
+                    ['pdflatex', '-interaction=nonstopmode',
+                     f'-output-directory={out_dir}', tex_path],
+                    capture_output=True, text=True, timeout=30
+                )
+        except Exception as e:
+            logger.warning(f"pdflatex 编译失败: {e}")
+            return ""
 
         pdf_path = os.path.join(out_dir, f"{filename}.pdf")
         if not os.path.exists(pdf_path):
+            logger.warning("pdflatex 未生成 PDF 文件")
+            return ""
+
+        # 检查 pdftoppm 是否可用
+        if not self._check_command("pdftoppm"):
+            logger.warning("pdftoppm 未安装，跳过 PDF→PNG 转换")
             return ""
 
         output_base = os.path.join(out_dir, filename)
-        subprocess.run(
-            ['pdftoppm', '-png', '-r', '300', pdf_path, output_base],
-            capture_output=True, timeout=30
-        )
+        try:
+            subprocess.run(
+                ['pdftoppm', '-png', '-r', '300', pdf_path, output_base],
+                capture_output=True, timeout=30
+            )
+        except Exception as e:
+            logger.warning(f"pdftoppm 转换失败: {e}")
+            return ""
 
         png_files = sorted(glob.glob(f"{output_base}*.png"))
         if png_files:
@@ -560,6 +580,14 @@ class GeometryRecognizer:
             Image.open(png_files[0]).save(final_path)
             return final_path
         return ""
+
+    def _check_command(self, cmd):
+        """检查系统命令是否存在"""
+        try:
+            subprocess.run([cmd, '--version'], capture_output=True, timeout=5)
+            return True
+        except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+            return False
 
     def compile_tex(self, tex_code, output_path=None):
         """外部接口：编译 TikZ 代码为 PNG"""
