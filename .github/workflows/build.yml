@@ -6,10 +6,18 @@ on:
       - 'v*'
     branches: [ main ]
   workflow_dispatch:
+  # 每周自动重试一次（如果 runner 暂时不可用）
+  schedule:
+    - cron: '0 6 * * 1'  # 每周一早上6点
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      matrix:
+        os: [windows-2022]  # 使用 windows-2022 替代 windows-latest
+      fail-fast: false
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
@@ -19,11 +27,6 @@ jobs:
         with:
           python-version: '3.10'
           architecture: 'x64'
-
-      - name: 安装系统依赖 (VC++ Redist)
-        run: |
-          choco install vcredist-all -y --no-progress 2>$null
-        shell: pwsh
 
       - name: 安装 Python 依赖
         run: |
@@ -72,10 +75,9 @@ jobs:
           name: GeometryRecognizer-Windows-x64
           path: dist/GeometryRecognizer.exe
 
-  # 可选：macOS 版本
+  # macOS 版本（独立构建，不依赖 Windows）
   build-mac:
     runs-on: macos-latest
-    needs: build
     steps:
       - uses: actions/checkout@v4
 
