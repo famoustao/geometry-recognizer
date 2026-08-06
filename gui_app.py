@@ -1,0 +1,1003 @@
+#!/usr/bin/env python3
+"""
+几何图形矢量化识别系统 — 桌面 GUI 版
+支持批量处理、单文件导出/合并导出、TikZ代码复制、原图/LaTeX预览
+"""
+import sys
+import os
+import math
+import glob
+import tempfile
+import shutil
+import subprocess
+import gc
+
+# ── 确保 geometry_app 可导入 ──
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QSplitter, QListWidget, QListWidgetItem, QPushButton, QLabel,
+    QTextEdit, QPlainTextEdit, QTabWidget, QFileDialog, QMessageBox,
+    QStatusBar, QMenuBar, QMenu, QMenuBar, QToolBar, QComboBox,
+    QDialog, QDialogButtonBox, QProgressBar, QFrame, QScrollArea,
+    QGroupBox, QGridLayout, QButtonGroup, QRadioButton, QSizePolicy,
+    QAbstractItemView, QStyle, QApplication as QA
+)
+from PySide6.QtCore import (
+    Qt, QThread, Signal, QSize, QTimer, QMutex, QMutexLocker,
+    QRunnable, QThreadPool, QObject, QRect
+)
+from PySide6.QtGui import (
+    QPixmap, QImage, QFont, QTextCursor, QAction, QIcon,
+    QPalette, QColor, QTextCharFormat, QSyntaxHighlighter,
+    QFontDatabase, QClipboard, QPainter, QPen, QBrush, QTransform,
+    QPageSize, QPageLayout
+)
+
+from geometry_app import GeometryRecognizer, RecognitionResult
+
+
+# ═══════════════════════════════════════════════════════════════
+# TikZ 语法高亮
+# ═══════════════════════════════════════════════════════════════
+
+class TikZHighlighter(QSyntaxHighlighter):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.rules = []
+
+        # 注释
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor("#6A9955"))
+        self.rules.append((r"%.*$", fmt))
+
+        # 关键字
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor("#569CD6"))
+        fmt.setFontWeight(QFont.Weight.Bold)
+        keywords = [
+            r"\\documentclass", r"\\usepackage", r"\\begin", r"\\end",
+            r"\\draw", r"\\node", r"\\coordinate", r"\\tikzset",
+            r"\\path", r"\\fill", r"\\clip", r"\\scope", r"\\foreach"
+        ]
+        for kw in keywords:
+            self.rules.append((kw, fmt))
+
+        # 环境/命令
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor("#DCDCAA"))
+        self.rules.append((r"\\(?:[a-zA-Z]+|\S)", fmt))
+
+        # 坐标/数字
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor("#B5CEA8"))
+        self.rules.append((r"-?\d+\.?\d*", fmt))
+
+        # 标签文本
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor("#CE9178"))
+        self.rules.append((r"\{[^}]*\}", fmt))
+
+        # 方括号属性
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor("#D7BA7D"))
+        self.rules.append((r"\[[^\]]*\]", fmt))
+
+        import re
+        self.rules = [(re.compile(p, re.MULTILINE), f) for p, f in self.rules]
+
+    def highlightBlock(self, text):
+        for pattern, fmt in self.rules:
+            for match in pattern.finditer(text):
+                start = match.start()
+                length = match.end() - start
+                self.setFormat(start, length, fmt)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 识别工作线程
+# ═══════════════════════════════════════════════════════════════
+
+class RecognizeWorker(QThread):
+    finished = Signal(str, object)  # image_path, RecognitionResult
+    progress = Signal(str, int)     # message, percent
+
+    def __init__(self, image_path, parent=None):
+        super().__init__(parent)
+        self.image_path = image_path
+
+    def run(self):
+        try:
+            recognizer = GeometryRecognizer()
+            self.progress.emit(f"识别中: {os.path.basename(self.image_path)}...", 30)
+            result = recognizer.recognize(self.image_path)
+            self.progress.emit(f"编译中: {os.path.basename(self.image_path)}...", 80)
+            recognizer.cleanup()
+            self.finished.emit(self.image_path, result)
+        except Exception as e:
+            import traceback
+            result = RecognitionResult()
+            result.error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+            self.finished.emit(self.image_path, result)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 图片列表项（自定义 Widget）
+# ═══════════════════════════════════════════════════════════════
+
+class ImageListItem(QWidget):
+    def __init__(self, path, index):
+        super().__init__()
+        self.path = path
+        self.index = index
+        self.status = "pending"  # pending, processing, done, failed
+        self.result = None
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(6)
+
+        self.status_label = QLabel("○")
+        self.status_label.setFixedWidth(16)
+        self.status_label.setStyleSheet("font-size: 14px;")
+        layout.addWidget(self.status_label)
+
+        self.name_label = QLabel(os.path.basename(path))
+        self.name_label.setStyleSheet("font-size: 12px;")
+        layout.addWidget(self.name_label, 1)
+
+        self.setLayout(layout)
+
+    def set_status(self, status):
+        self.status = status
+        icons = {
+            "pending": ("○", "#888"),
+            "processing": ("◌", "#2196F3"),
+            "done": ("✓", "#4CAF50"),
+            "failed": ("✗", "#F44336"),
+        }
+        icon, color = icons.get(status, ("○", "#888"))
+        self.status_label.setText(icon)
+        self.status_label.setStyleSheet(f"font-size: 14px; color: {color};")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 主窗口
+# ═══════════════════════════════════════════════════════════════
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("几何图形矢量化识别系统")
+        self.setMinimumSize(1400, 900)
+        self.resize(1600, 1000)
+
+        # ── 数据 ──
+        self.image_paths = []           # 所有图片路径
+        self.results = {}               # path -> RecognitionResult
+        self.current_index = -1
+        self.recognizer_pool = {}       # path -> RecognizeWorker
+        self.merge_tex_cache = ""       # 合并导出用
+
+        # ── 构建 UI ──
+        self._setup_menu()
+        self._setup_central()
+        self._setup_statusbar()
+
+        # ── 样式 ──
+        self._apply_style()
+
+        # ── 定时器（非阻塞编译） ──
+        self.compile_timer = QTimer(self)
+        self.compile_timer.setSingleShot(True)
+        self.compile_timer.timeout.connect(self._update_compile)
+
+    # ────────────────────────────────────────────────────
+    # 菜单栏
+    # ────────────────────────────────────────────────────
+
+    def _setup_menu(self):
+        menubar = self.menuBar()
+
+        # 文件
+        file_menu = menubar.addMenu("文件(&F)")
+        act_open_img = QAction("打开图片...", self)
+        act_open_img.setShortcut("Ctrl+O")
+        act_open_img.triggered.connect(self._on_open_images)
+        file_menu.addAction(act_open_img)
+
+        act_open_dir = QAction("打开文件夹...", self)
+        act_open_dir.setShortcut("Ctrl+Shift+O")
+        act_open_dir.triggered.connect(self._on_open_folder)
+        file_menu.addAction(act_open_dir)
+
+        file_menu.addSeparator()
+        act_remove = QAction("移除选中", self)
+        act_remove.setShortcut("Delete")
+        act_remove.triggered.connect(self._on_remove_selected)
+        file_menu.addAction(act_remove)
+
+        act_clear = QAction("清空列表", self)
+        act_clear.triggered.connect(self._on_clear_list)
+        file_menu.addAction(act_clear)
+
+        file_menu.addSeparator()
+        act_exit = QAction("退出", self)
+        act_exit.setShortcut("Ctrl+Q")
+        act_exit.triggered.connect(self.close)
+        file_menu.addAction(act_exit)
+
+        # 识别
+        rec_menu = menubar.addMenu("识别(&R)")
+        act_rec_cur = QAction("识别当前图片", self)
+        act_rec_cur.setShortcut("F5")
+        act_rec_cur.triggered.connect(self._on_recognize_current)
+        rec_menu.addAction(act_rec_cur)
+
+        act_rec_all = QAction("识别全部图片", self)
+        act_rec_all.setShortcut("Ctrl+F5")
+        act_rec_all.triggered.connect(self._on_recognize_all)
+        rec_menu.addAction(act_rec_all)
+
+        # 导出
+        export_menu = menubar.addMenu("导出(&E)")
+        act_exp_tex = QAction("导出 TEX...", self)
+        act_exp_tex.setShortcut("Ctrl+S")
+        act_exp_tex.triggered.connect(self._on_export_tex)
+        export_menu.addAction(act_exp_tex)
+
+        act_exp_png = QAction("导出 PNG...", self)
+        act_exp_png.setShortcut("Ctrl+Shift+S")
+        act_exp_png.triggered.connect(self._on_export_png)
+        export_menu.addAction(act_exp_png)
+
+        export_menu.addSeparator()
+        act_merge = QAction("合并导出全部...", self)
+        act_merge.setShortcut("Ctrl+M")
+        act_merge.triggered.connect(self._on_merge_export)
+        export_menu.addAction(act_merge)
+
+        # 帮助
+        help_menu = menubar.addMenu("帮助(&H)")
+        act_about = QAction("关于", self)
+        act_about.triggered.connect(self._on_about)
+        help_menu.addAction(act_about)
+
+    # ────────────────────────────────────────────────────
+    # 中央区域
+    # ────────────────────────────────────────────────────
+
+    def _setup_central(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(6, 6, 6, 6)
+        main_layout.setSpacing(6)
+
+        splitter = QSplitter(Qt.Horizontal)
+
+        # ── 左面板：图片列表 ──
+        left_panel = self._create_left_panel()
+        splitter.addWidget(left_panel)
+
+        # ── 中面板：预览 ──
+        center_panel = self._create_center_panel()
+        splitter.addWidget(center_panel)
+
+        # ── 右面板：代码 + 操作 ──
+        right_panel = self._create_right_panel()
+        splitter.addWidget(right_panel)
+
+        splitter.setSizes([220, 620, 400])
+        main_layout.addWidget(splitter)
+
+    def _create_left_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        title = QLabel("📁 图片列表")
+        title.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px;")
+        layout.addWidget(title)
+
+        # 列表
+        self.list_widget = QListWidget()
+        self.list_widget.setAlternatingRowColors(True)
+        self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list_widget.currentRowChanged.connect(self._on_selection_changed)
+        layout.addWidget(self.list_widget, 1)
+
+        # 操作按钮
+        btn_layout = QHBoxLayout()
+        self.btn_add = QPushButton("+ 添加")
+        self.btn_add.clicked.connect(self._on_open_images)
+        self.btn_remove = QPushButton("— 移除")
+        self.btn_remove.clicked.connect(self._on_remove_selected)
+        btn_layout.addWidget(self.btn_add)
+        btn_layout.addWidget(self.btn_remove)
+        layout.addLayout(btn_layout)
+
+        # 批量操作
+        batch_group = QGroupBox("批量操作")
+        batch_layout = QVBoxLayout(batch_group)
+        self.btn_rec_all = QPushButton("▶ 全部识别")
+        self.btn_rec_all.clicked.connect(self._on_recognize_all)
+        batch_layout.addWidget(self.btn_rec_all)
+
+        self.btn_export_all = QPushButton("📄 全部导出 TEX")
+        self.btn_export_all.clicked.connect(self._on_export_all_tex)
+        batch_layout.addWidget(self.btn_export_all)
+
+        self.btn_merge = QPushButton("📑 合并导出")
+        self.btn_merge.clicked.connect(self._on_merge_export)
+        batch_layout.addWidget(self.btn_merge)
+        layout.addWidget(batch_group)
+
+        return panel
+
+    def _create_center_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        # 标题栏
+        title_layout = QHBoxLayout()
+        self.preview_title = QLabel("🖼 预览")
+        self.preview_title.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px;")
+        title_layout.addWidget(self.preview_title, 1)
+
+        # 预览模式切换
+        self.preview_mode = QButtonGroup(self)
+        self.rb_original = QRadioButton("原图")
+        self.rb_latex = QRadioButton("LaTeX渲染")
+        self.rb_latex.setEnabled(False)
+        self.rb_original.setChecked(True)
+        self.preview_mode.addButton(self.rb_original, 0)
+        self.preview_mode.addButton(self.rb_latex, 1)
+        self.preview_mode.idClicked.connect(self._on_preview_mode_changed)
+        title_layout.addWidget(self.rb_original)
+        title_layout.addWidget(self.rb_latex)
+        layout.addLayout(title_layout)
+
+        # 预览区域（滚动）
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("border: 1px solid #ddd; background: #fafafa;")
+        self.preview_label = QLabel("请添加图片并开始识别")
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setStyleSheet("font-size: 14px; color: #888;")
+        scroll.setWidget(self.preview_label)
+        layout.addWidget(scroll, 1)
+
+        # 识别信息
+        self.info_label = QLabel("")
+        self.info_label.setWordWrap(True)
+        self.info_label.setStyleSheet(
+            "font-size: 11px; color: #333; padding: 4px; "
+            "background: #f5f5f5; border: 1px solid #ddd; border-radius: 4px;"
+        )
+        self.info_label.setMaximumHeight(80)
+        layout.addWidget(self.info_label)
+
+        return panel
+
+    def _create_right_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        title = QLabel("📝 TikZ 代码")
+        title.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px;")
+        layout.addWidget(title)
+
+        # 代码编辑器
+        self.code_edit = QPlainTextEdit()
+        self.code_edit.setReadOnly(True)
+        self.code_edit.setFont(QFont("Consolas, 'Courier New', monospace", 10))
+        self.code_edit.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.code_edit.setStyleSheet(
+            "background: #1E1E1E; color: #D4D4D4; "
+            "border: 1px solid #333; border-radius: 4px; padding: 4px;"
+        )
+        self.highlighter = TikZHighlighter(self.code_edit.document())
+        layout.addWidget(self.code_edit, 1)
+
+        # 操作按钮
+        btn_layout = QHBoxLayout()
+
+        self.btn_copy = QPushButton("📋 复制代码")
+        self.btn_copy.clicked.connect(self._on_copy_code)
+        btn_layout.addWidget(self.btn_copy)
+
+        self.btn_export_tex = QPushButton("📄 导出 TEX")
+        self.btn_export_tex.clicked.connect(self._on_export_tex)
+        btn_layout.addWidget(self.btn_export_tex)
+
+        self.btn_export_png = QPushButton("🖼 导出 PNG")
+        self.btn_export_png.clicked.connect(self._on_export_png)
+        btn_layout.addWidget(self.btn_export_png)
+
+        layout.addLayout(btn_layout)
+
+        # 状态标签
+        self.code_status = QLabel("就绪")
+        self.code_status.setStyleSheet("font-size: 11px; color: #666; padding: 2px;")
+        layout.addWidget(self.code_status)
+
+        return panel
+
+    # ────────────────────────────────────────────────────
+    # 状态栏
+    # ────────────────────────────────────────────────────
+
+    def _setup_statusbar(self):
+        self.statusbar = QStatusBar()
+        self.setStatusBar(self.statusbar)
+        self.status_label = QLabel("已就绪")
+        self.statusbar.addWidget(self.status_label, 1)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumWidth(200)
+        self.progress_bar.setMaximumHeight(16)
+        self.progress_bar.setVisible(False)
+        self.statusbar.addPermanentWidget(self.progress_bar)
+
+    # ────────────────────────────────────────────────────
+    # 样式
+    # ────────────────────────────────────────────────────
+
+    def _apply_style(self):
+        self.setStyleSheet("""
+            QMainWindow { background: #f0f0f0; }
+            QGroupBox {
+                font-size: 11px; font-weight: bold;
+                border: 1px solid #ccc; border-radius: 4px;
+                margin-top: 8px; padding-top: 14px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 2px 6px;
+            }
+            QPushButton {
+                padding: 5px 12px;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                background: #fff;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background: #e3f2fd;
+                border-color: #2196F3;
+            }
+            QPushButton:pressed { background: #bbdefb; }
+            QListWidget {
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background: #fff;
+                font-size: 11px;
+            }
+            QListWidget::item:selected {
+                background: #e3f2fd;
+                color: #000;
+            }
+            QRadioButton { font-size: 11px; }
+            QProgressBar {
+                border: 1px solid #ccc;
+                border-radius: 3px;
+                text-align: center;
+                font-size: 10px;
+            }
+            QProgressBar::chunk {
+                background: #4CAF50;
+                border-radius: 2px;
+            }
+        """)
+
+    # ────────────────────────────────────────────────────
+    # 图片列表操作
+    # ────────────────────────────────────────────────────
+
+    def _add_images(self, paths):
+        for path in paths:
+            ext = os.path.splitext(path)[1].lower()
+            if ext not in ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'):
+                continue
+            if path in self.image_paths:
+                continue
+            self.image_paths.append(path)
+            item = QListWidgetItem()
+            widget = ImageListItem(path, len(self.image_paths) - 1)
+            item.setSizeHint(widget.sizeHint())
+            self.list_widget.addItem(item)
+            self.list_widget.setItemWidget(item, widget)
+
+        self._update_status()
+        if self.image_paths and self.current_index < 0:
+            self.list_widget.setCurrentRow(0)
+
+    def _on_open_images(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择图片", "",
+            "图片文件 (*.jpg *.jpeg *.png *.bmp *.tiff *.webp);;所有文件 (*)"
+        )
+        if paths:
+            self._add_images(paths)
+
+    def _on_open_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择文件夹")
+        if folder:
+            paths = []
+            for ext in ('*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff', '*.webp'):
+                paths.extend(glob.glob(os.path.join(folder, ext)))
+                paths.extend(glob.glob(os.path.join(folder, ext.upper())))
+            paths = sorted(set(paths))
+            if paths:
+                self._add_images(paths)
+            else:
+                QMessageBox.information(self, "提示", "文件夹中没有找到图片文件")
+
+    def _on_remove_selected(self):
+        rows = sorted(set(
+            i.row() for i in self.list_widget.selectedIndexes()
+        ), reverse=True)
+        for row in rows:
+            if 0 <= row < len(self.image_paths):
+                path = self.image_paths[row]
+                if path in self.results:
+                    del self.results[path]
+                del self.image_paths[row]
+                self.list_widget.takeItem(row)
+        self._update_status()
+        if self.list_widget.count() > 0:
+            self.list_widget.setCurrentRow(min(self.list_widget.count() - 1, max(rows) if rows else 0))
+        else:
+            self._clear_preview()
+
+    def _on_clear_list(self):
+        self.image_paths.clear()
+        self.results.clear()
+        self.list_widget.clear()
+        self._clear_preview()
+        self._update_status()
+
+    def _on_selection_changed(self, row):
+        if 0 <= row < len(self.image_paths):
+            self.current_index = row
+            self._show_image(row)
+        else:
+            self.current_index = -1
+
+    # ────────────────────────────────────────────────────
+    # 预览
+    # ────────────────────────────────────────────────────
+
+    def _show_image(self, index):
+        if not (0 <= index < len(self.image_paths)):
+            return
+        path = self.image_paths[index]
+        self.preview_title.setText(f"🖼 预览: {os.path.basename(path)}")
+
+        if self.rb_original.isChecked():
+            self._show_original(path)
+        else:
+            self._show_latex_preview(path)
+
+        self._update_info(index)
+        self._update_code(index)
+
+    def _show_original(self, path):
+        pixmap = QPixmap(path)
+        if not pixmap.isNull():
+            scaled = pixmap.scaled(
+                self.preview_label.size(), Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+            # 在图片上叠加顶点标注
+            if path in self.results and self.results[path].success:
+                painter = QPainter(pixmap)
+                pen = QPen(QColor("#FF5722"), 3)
+                painter.setPen(pen)
+                result = self.results[path]
+                for name, pt in result.key_points.items():
+                    if name == 'O':
+                        continue
+                    x, y = int(pt[0]), int(pt[1])
+                    painter.drawEllipse(x-4, y-4, 8, 8)
+                    painter.setPen(QPen(QColor("#FF5722"), 1))
+                    painter.drawText(x+6, y-6, name)
+                    painter.setPen(QPen(QColor("#FF5722"), 3))
+                painter.end()
+                scaled = pixmap.scaled(
+                    self.preview_label.size(), Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+
+            self.preview_label.setPixmap(scaled)
+        else:
+            self.preview_label.setText("无法加载图片")
+
+    def _show_latex_preview(self, path):
+        if path in self.results and self.results[path].success:
+            preview_path = self.results[path].preview_image_path
+            if preview_path and os.path.exists(preview_path):
+                pixmap = QPixmap(preview_path)
+                if not pixmap.isNull():
+                    scaled = pixmap.scaled(
+                        self.preview_label.size(), Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation
+                    )
+                    self.preview_label.setPixmap(scaled)
+                    return
+        self.preview_label.setText("尚无 LaTeX 渲染结果")
+
+    def _on_preview_mode_changed(self, mode_id):
+        if self.current_index >= 0:
+            self._show_image(self.current_index)
+
+    def _clear_preview(self):
+        self.preview_label.setText("请添加图片并开始识别")
+        self.preview_title.setText("🖼 预览")
+        self.code_edit.clear()
+        self.info_label.clear()
+        self.code_status.setText("就绪")
+
+    # ────────────────────────────────────────────────────
+    # 信息显示
+    # ────────────────────────────────────────────────────
+
+    def _update_info(self, index):
+        if not (0 <= index < len(self.image_paths)):
+            self.info_label.clear()
+            return
+        path = self.image_paths[index]
+        if path not in self.results:
+            self.info_label.setText("⏳ 尚未识别")
+            return
+        result = self.results[path]
+        if not result.success:
+            self.info_label.setText(f"❌ 识别失败:\n{result.error[:200]}")
+            return
+
+        pts = result.key_points
+        valid = result.valid_connections
+        info = []
+        info.append("✅ 识别成功")
+        info.append(f"  顶点: {', '.join(pts.keys())}")
+        info.append(f"  检测到线段: {len(valid)} 条")
+        for p1, p2, conf in valid:
+            info.append(f"    {p1}-{p2}: {conf:.0f}%")
+        info.append(f"  构造层辅助线: DF, EG, DG, EF")
+        self.info_label.setText("\n".join(info))
+
+    def _update_code(self, index):
+        if not (0 <= index < len(self.image_paths)):
+            self.code_edit.clear()
+            return
+        path = self.image_paths[index]
+        if path not in self.results or not self.results[path].success:
+            self.code_edit.clear()
+            self.code_status.setText("尚无代码")
+            return
+
+        tex = self.results[path].tex_code
+        self.code_edit.setPlainText(tex)
+        self.code_status.setText(f"代码行数: {tex.count(chr(10)) + 1}")
+
+    def _update_status(self):
+        self.status_label.setText(
+            f"已加载 {len(self.image_paths)} 张图片 | "
+            f"已识别 {sum(1 for r in self.results.values() if r.success)} 张"
+        )
+
+    # ────────────────────────────────────────────────────
+    # 识别逻辑
+    # ────────────────────────────────────────────────────
+
+    def _on_recognize_current(self):
+        if self.current_index < 0:
+            QMessageBox.information(self, "提示", "请先选择一张图片")
+            return
+        path = self.image_paths[self.current_index]
+        self._start_recognize(path)
+
+    def _on_recognize_all(self):
+        if not self.image_paths:
+            QMessageBox.information(self, "提示", "请先添加图片")
+            return
+        for path in self.image_paths:
+            if path not in self.results:
+                self._start_recognize(path)
+
+    def _start_recognize(self, path):
+        if path in self.recognizer_pool:
+            return  # 已在识别中
+
+        # 更新列表状态
+        item = self._find_item_by_path(path)
+        if item:
+            item.set_status("processing")
+
+        # 启动线程
+        worker = RecognizeWorker(path)
+        worker.finished.connect(self._on_recognize_finished)
+        worker.progress.connect(self._on_recognize_progress)
+        self.recognizer_pool[path] = worker
+        worker.start()
+
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setText(f"正在识别: {os.path.basename(path)}...")
+
+    def _on_recognize_progress(self, message, percent):
+        self.status_label.setText(message)
+        self.progress_bar.setValue(percent)
+
+    def _on_recognize_finished(self, image_path, result):
+        if image_path in self.recognizer_pool:
+            del self.recognizer_pool[image_path]
+
+        self.results[image_path] = result
+
+        # 更新列表状态
+        item = self._find_item_by_path(image_path)
+        if item:
+            item.set_status("done" if result.success else "failed")
+            item.result = result
+
+        # 如果是当前选中的图片，更新显示
+        if (self.current_index >= 0 and
+            self.current_index < len(self.image_paths) and
+            self.image_paths[self.current_index] == image_path):
+            self._show_image(self.current_index)
+
+        self._update_status()
+
+        # 更新进度条
+        if not self.recognizer_pool:
+            self.progress_bar.setVisible(False)
+            done = sum(1 for r in self.results.values() if r.success)
+            failed = sum(1 for r in self.results.values() if not r.success)
+            self.status_label.setText(f"识别完成: {done} 成功, {failed} 失败")
+
+    def _find_item_by_path(self, path):
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            widget = self.list_widget.itemWidget(item)
+            if widget and widget.path == path:
+                return widget
+        return None
+
+    # ────────────────────────────────────────────────────
+    # 导出
+    # ────────────────────────────────────────────────────
+
+    def _on_copy_code(self):
+        tex = self.code_edit.toPlainText()
+        if not tex:
+            QMessageBox.information(self, "提示", "没有可复制的代码")
+            return
+        clipboard = QApplication.clipboard()
+        clipboard.setText(tex)
+        self.code_status.setText("✔ 已复制到剪贴板")
+        QTimer.singleShot(2000, lambda: self.code_status.setText("代码已复制"))
+
+    def _on_export_tex(self):
+        path = self._get_current_image_path()
+        if not path:
+            QMessageBox.information(self, "提示", "请先选择一张图片")
+            return
+        if path not in self.results or not self.results[path].success:
+            QMessageBox.information(self, "提示", "当前图片尚未识别成功")
+            return
+
+        default_name = os.path.splitext(os.path.basename(path))[0] + ".tex"
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "导出 TEX", default_name,
+            "LaTeX 文件 (*.tex);;所有文件 (*)"
+        )
+        if save_path:
+            with open(save_path, 'w', encoding='utf-8') as f:
+                f.write(self.results[path].tex_code)
+            self.status_label.setText(f"已导出: {save_path}")
+
+    def _on_export_png(self):
+        path = self._get_current_image_path()
+        if not path:
+            QMessageBox.information(self, "提示", "请先选择一张图片")
+            return
+        if path not in self.results or not self.results[path].success:
+            QMessageBox.information(self, "提示", "当前图片尚未识别成功")
+            return
+
+        preview_path = self.results[path].preview_image_path
+        if not preview_path or not os.path.exists(preview_path):
+            # 重新编译
+            recognizer = GeometryRecognizer()
+            preview_path = recognizer.compile_tex(self.results[path].tex_code)
+            self.results[path].preview_image_path = preview_path
+
+        if not preview_path or not os.path.exists(preview_path):
+            QMessageBox.warning(self, "错误", "编译失败，请检查 LaTeX 环境")
+            return
+
+        default_name = os.path.splitext(os.path.basename(path))[0] + ".png"
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "导出 PNG", default_name,
+            "PNG 图片 (*.png);;所有文件 (*)"
+        )
+        if save_path:
+            shutil.copy2(preview_path, save_path)
+            self.status_label.setText(f"已导出: {save_path}")
+
+    def _on_export_all_tex(self):
+        """批量导出所有识别结果的 TEX 文件"""
+        if not self.results:
+            QMessageBox.information(self, "提示", "没有已识别的结果")
+            return
+
+        folder = QFileDialog.getExistingDirectory(self, "选择导出文件夹")
+        if not folder:
+            return
+
+        count = 0
+        for path, result in self.results.items():
+            if not result.success:
+                continue
+            name = os.path.splitext(os.path.basename(path))[0]
+            tex_path = os.path.join(folder, f"{name}.tex")
+            with open(tex_path, 'w', encoding='utf-8') as f:
+                f.write(result.tex_code)
+            count += 1
+
+        QMessageBox.information(self, "导出完成", f"已导出 {count} 个 TEX 文件到:\n{folder}")
+
+    def _on_merge_export(self):
+        """合并导出所有识别结果为单个 PDF"""
+        successful = [p for p, r in self.results.items() if r.success]
+        if not successful:
+            QMessageBox.information(self, "提示", "没有已识别成功的结果")
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self, "合并导出", "merged_output.tex",
+            "LaTeX 文件 (*.tex);;PDF 文件 (*.pdf);;所有文件 (*)"
+        )
+        if not save_path:
+            return
+
+        # 生成合并的 LaTeX 文档
+        lines = []
+        lines.append(r"\documentclass[a4paper]{article}")
+        lines.append(r"\usepackage{tikz}")
+        lines.append(r"\usetikzlibrary{arrows}")
+        lines.append(r"\usepackage[margin=1cm]{geometry}")
+        lines.append(r"\usepackage{graphicx}")
+        lines.append("")
+        lines.append(r"\begin{document}")
+        lines.append(r"\title{几何图形识别结果汇总}")
+        lines.append(r"\author{自动生成}")
+        lines.append(r"\maketitle")
+        lines.append(r"\tableofcontents")
+        lines.append(r"\newpage")
+
+        for i, path in enumerate(successful):
+            result = self.results[path]
+            name = os.path.basename(path)
+            lines.append(f"")
+            lines.append(r"\section{%s}" % name.replace('_', r'\_'))
+            lines.append("")
+
+            # 嵌入原图
+            lines.append(r"\noindent\textbf{原图:}\\\\" )
+            lines.append(r"\includegraphics[width=0.6\textwidth]{%s}" % path)
+            lines.append("")
+
+            # 嵌入 TikZ 代码
+            lines.append(r"\noindent\textbf{识别结果:}\\\\" )
+            lines.append(result.tex_code.replace(r"\begin{document}", "")
+                                            .replace(r"\end{document}", "")
+                                            .replace(r"\begin{tikzpicture}",
+                                                     r"\begin{tikzpicture}[scale=0.8]"))
+            lines.append("")
+            lines.append(r"\noindent\textbf{TikZ 代码:}\\\\" )
+            lines.append(r"\begin{verbatim}")
+            lines.append(result.tex_code)
+            lines.append(r"\end{verbatim}")
+            lines.append(r"\newpage")
+
+        lines.append(r"\end{document}")
+
+        tex_content = "\n".join(lines)
+
+        # 保存 TEX
+        with open(save_path, 'w', encoding='utf-8') as f:
+            f.write(tex_content)
+
+        # 编译
+        self.status_label.setText("正在编译合并文档...")
+        out_dir = os.path.dirname(save_path)
+        base_name = os.path.splitext(os.path.basename(save_path))[0]
+
+        for i in range(2):
+            subprocess.run(
+                ['pdflatex', '-interaction=nonstopmode',
+                 f'-output-directory={out_dir}', save_path],
+                capture_output=True, text=True, timeout=60
+            )
+
+        pdf_path = os.path.join(out_dir, f"{base_name}.pdf")
+        if os.path.exists(pdf_path):
+            self.status_label.setText(f"合并导出完成: {pdf_path}")
+            QMessageBox.information(self, "导出完成",
+                f"合并 PDF 已生成:\n{pdf_path}")
+        else:
+            QMessageBox.warning(self, "编译失败",
+                "LaTeX 编译失败，已保存 TEX 文件，请手动编译。")
+
+    def _get_current_image_path(self):
+        if self.current_index >= 0 and self.current_index < len(self.image_paths):
+            return self.image_paths[self.current_index]
+        return None
+
+    # ────────────────────────────────────────────────────
+    # 编译更新（定时器回调用）
+    # ────────────────────────────────────────────────────
+
+    def _update_compile(self):
+        pass  # 预留
+
+    # ────────────────────────────────────────────────────
+    # 关于
+    # ────────────────────────────────────────────────────
+
+    def _on_about(self):
+        QMessageBox.about(self, "关于",
+            "几何图形矢量化识别系统\n\n"
+            "基于多特征融合的手绘几何图形矢量化识别算法\n\n"
+            "功能：\n"
+            "  • 手绘几何图形识别\n"
+            "  • 自动生成 TikZ 代码\n"
+            "  • 批量处理\n"
+            "  • 合并导出\n\n"
+            "技术栈: Python + OpenCV + PySide6 + LaTeX"
+        )
+
+    # ────────────────────────────────────────────────────
+    # 析构
+    # ────────────────────────────────────────────────────
+
+    def closeEvent(self, event):
+        # 等待所有识别线程结束
+        for worker in self.recognizer_pool.values():
+            worker.wait(5000)
+        super().closeEvent(event)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 入口
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    # 高DPI支持
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+    app = QApplication(sys.argv)
+    app.setApplicationName("几何图形矢量化识别系统")
+
+    # 设置全局字体
+    font = QFont("Microsoft YaHei, 'Noto Sans CJK SC', 'PingFang SC', sans-serif", 10)
+    app.setFont(font)
+
+    window = MainWindow()
+    window.show()
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
