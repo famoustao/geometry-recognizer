@@ -64,7 +64,6 @@ python gui_app.py
 pip install pyinstaller
 pyinstaller --onefile --windowed --name GeometryRecognizer \
   --add-data "geometry_app;geometry_app" \
-  --add-data "geometry_recognizer;geometry_recognizer" \
   gui_app.py
 ```
 
@@ -72,20 +71,11 @@ pyinstaller --onefile --windowed --name GeometryRecognizer \
 
 ```
 ├── gui_app.py                    # 桌面 GUI 主程序（入口）
-├── run_uploaded_v4.py            # 命令行版本
 ├── geometry_app/
 │   ├── __init__.py
-│   └── recognizer.py             # 识别引擎（可复用 API）
-├── geometry_recognizer/          # 原算法库（模块化）
-│   ├── config.py
-│   ├── data_structures.py
-│   ├── latex_generator.py
-│   ├── main.py
-│   ├── preprocessing.py
-│   ├── primitive_recognition.py
-│   ├── topology.py
-│   ├── utils.py
-│   └── vertex_detection.py
+│   ├── recognizer.py             # 识别引擎（可复用 API）
+│   └── logger.py                 # 日志系统
+├── run_uploaded_v4.py            # 命令行版本（旧）
 ├── uploaded_geometry.jpeg        # 测试图片
 └── .github/workflows/
     ├── build.yml                 # 自动编译 EXE

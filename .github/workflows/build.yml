@@ -45,7 +45,6 @@ jobs:
         run: |
           pyinstaller --onefile --windowed --name GeometryRecognizer `
             --add-data "geometry_app;geometry_app" `
-            --add-data "geometry_recognizer;geometry_recognizer" `
             --hidden-import "PIL._tkinter_finder" `
             --icon NONE `
             gui_app.py
@@ -92,7 +91,6 @@ jobs:
         run: |
           pyinstaller --onefile --windowed --name GeometryRecognizer \
             --add-data "geometry_app:geometry_app" \
-            --add-data "geometry_recognizer:geometry_recognizer" \
             gui_app.py
 
       - name: 上传 macOS 构建产物
