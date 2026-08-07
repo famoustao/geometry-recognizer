@@ -11,7 +11,10 @@ import tempfile
 import shutil
 import subprocess
 import gc
+import pickle
 import traceback
+import faulthandler
+import multiprocessing as mp
 from datetime import datetime
 
 # ── 确保 geometry_app 可导入 ──
@@ -143,6 +146,76 @@ class TikZHighlighter(QSyntaxHighlighter):
 
 
 # ═══════════════════════════════════════════════════════════════
+# 子进程识别函数（防止 OpenCV segfault 导致 GUI 崩溃）
+# ═══════════════════════════════════════════════════════════════
+
+def _subprocess_recognize(image_path, backend, circle_tol, circle_hit, line_tol, line_hit, output_file):
+    """
+    在独立子进程中运行识别（用文件传递结果，避免 mp.Queue 在 PyInstaller 下的问题）
+    即使 OpenCV 内部崩溃也不会影响 GUI 进程
+    """
+    try:
+        # 子进程需要重新设置路径
+        import sys
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, script_dir)
+
+        # 启用 faulthandler 在子进程中也捕获 segfault
+        faulthandler.enable()
+
+        from geometry_app import create_recognizer, RecognitionResult
+        from geometry_app.logger import logger, flush_log
+
+        logger.info(f"子进程启动: 识别 {image_path}")
+        flush_log()
+
+        recognizer = create_recognizer(
+            backend=backend,
+            circle_pixel_tolerance=circle_tol,
+            circle_hit_threshold=circle_hit,
+            line_pixel_tolerance=line_tol,
+            line_hit_threshold=line_hit,
+        )
+        result = recognizer.recognize(
+            image_path,
+            line_pixel_tolerance=line_tol,
+            line_hit_threshold=line_hit,
+        )
+        recognizer.cleanup()
+
+        logger.info(f"子进程识别完成: {image_path}")
+        flush_log()
+
+        # 将结果写入临时文件
+        with open(output_file, 'wb') as f:
+            pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
+        logger.info(f"子进程结果已写入: {output_file}")
+        flush_log()
+    except Exception as e:
+        tb = traceback.format_exc()
+        # 写入 crash 日志
+        try:
+            crash_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash_log.txt")
+            with open(crash_path, 'a', encoding='utf-8') as f:
+                f.write(f"\n{'='*60}\n")
+                f.write(f"子进程识别异常: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"图片: {image_path}\n")
+                f.write(f"错误: {type(e).__name__}: {str(e)}\n")
+                f.write(f"堆栈:\n{tb}\n")
+                f.write(f"{'='*60}\n")
+        except Exception:
+            pass
+        # 异常也写入文件
+        result = RecognitionResult()
+        result.error = f"{type(e).__name__}: {str(e)}\n{tb}"
+        try:
+            with open(output_file, 'wb') as f:
+                pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════
 # 识别工作线程
 # ═══════════════════════════════════════════════════════════════
 
@@ -163,23 +236,70 @@ class RecognizeWorker(QThread):
 
     def run(self):
         try:
-            recognizer = create_recognizer(
-                backend=self.backend,
-                circle_pixel_tolerance=self.circle_pixel_tolerance,
-                circle_hit_threshold=self.circle_hit_threshold,
-                line_pixel_tolerance=self.line_pixel_tolerance,
-                line_hit_threshold=self.line_hit_threshold,
+            self.progress.emit(f"识别中: {os.path.basename(self.image_path)}...", 10)
+
+            # ── 使用临时文件传递结果（避免 mp.Queue 在 PyInstaller 下的问题） ──
+            result_file = os.path.join(tempfile.gettempdir(),
+                f"geo_recog_result_{os.getpid()}_{datetime.now().strftime('%H%M%S%f')}.pkl")
+
+            # 使用 multiprocessing 在独立子进程中运行识别
+            # 即使 OpenCV 内部 segfault，GUI 进程也不会崩溃
+            ctx = mp.get_context('spawn')
+            proc = ctx.Process(
+                target=_subprocess_recognize,
+                args=(self.image_path, self.backend,
+                      self.circle_pixel_tolerance, self.circle_hit_threshold,
+                      self.line_pixel_tolerance, self.line_hit_threshold,
+                      result_file),
+                daemon=True,
             )
+            proc.start()
             self.progress.emit(f"识别中: {os.path.basename(self.image_path)}...", 30)
-            result = recognizer.recognize(
-                self.image_path,
-                line_pixel_tolerance=self.line_pixel_tolerance,
-                line_hit_threshold=self.line_hit_threshold,
-            )
+
+            # 等待子进程完成（最长 120 秒）
+            proc.join(timeout=120)
+
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=5)
+                raise Exception("识别超时（120秒），请检查图片是否过大或损坏")
+
+            # 从临时文件读取结果
+            result = None
+            if os.path.exists(result_file) and os.path.getsize(result_file) > 0:
+                try:
+                    with open(result_file, 'rb') as f:
+                        result = pickle.load(f)
+                except Exception as e:
+                    logger.error(f"读取子进程结果文件失败: {e}")
+
+            # 清理临时文件
+            try:
+                if os.path.exists(result_file):
+                    os.remove(result_file)
+            except Exception:
+                pass
+
+            if result is None:
+                if proc.exitcode != 0:
+                    raise Exception(f"识别子进程异常退出 (exit code: {proc.exitcode})")
+                else:
+                    raise Exception("识别子进程未输出结果，可能发生了内部崩溃")
+
+            # 确保 result 是 RecognitionResult 类型
+            if not isinstance(result, RecognitionResult):
+                # 从 dict 恢复
+                if isinstance(result, dict):
+                    r = RecognitionResult()
+                    r.__dict__.update(result)
+                    result = r
+
             self.progress.emit(f"编译中: {os.path.basename(self.image_path)}...", 80)
-            recognizer.cleanup()
             self.finished.emit(self.image_path, result)
+
         except Exception as e:
+            logger.error(f"识别工作线程异常: {type(e).__name__}: {str(e)}")
+            logger.error(traceback.format_exc())
             result = RecognitionResult()
             result.error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
             self.finished.emit(self.image_path, result)
@@ -1590,6 +1710,18 @@ class MainWindow(QMainWindow):
 
 def main():
     try:
+        # ── PyInstaller 兼容：让 multiprocessing 子进程能正确启动 ──
+        mp.freeze_support()
+
+        # 启用 faulthandler 捕获 C 层 segfault，输出到程序目录
+        crash_fd_path = os.path.join(PROGRAM_DIR, "crash_faulthandler.log")
+        try:
+            crash_fd = open(crash_fd_path, "a")
+            faulthandler.enable(file=crash_fd)
+            logger.info(f"faulthandler 已启用: {crash_fd_path}")
+        except Exception as e:
+            logger.warning(f"faulthandler 启用失败: {e}")
+
         # 高DPI支持
         QApplication.setHighDpiScaleFactorRoundingPolicy(
             Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
