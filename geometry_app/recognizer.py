@@ -91,7 +91,7 @@ class RecognitionResult:
 class GeometryRecognizer:
     """几何图形识别引擎"""
 
-    def __init__(self, circle_pixel_tolerance=2, circle_hit_threshold=0.50):
+    def __init__(self, circle_pixel_tolerance=2, circle_hit_threshold=0.30):
         self.temp_dir = tempfile.mkdtemp(prefix="geo_recog_")
         self._setup_geometry_constraints()
         self.circle_pixel_tolerance = circle_pixel_tolerance  # 像素搜索半径 ±N px
@@ -214,10 +214,12 @@ class GeometryRecognizer:
 
             logger.info(f"  F=({F[0]:.0f},{F[1]:.0f}) G=({G[0]:.0f},{G[1]:.0f}) M=({M[0]:.0f},{M[1]:.0f})")
 
-            key_points = {
+            # 验证并清理几何点：裁剪到边界、移除退化点
+            raw_points = {
                 'A': A, 'B': B, 'C': C, 'D': D, 'E': E,
                 'F': F, 'G': G, 'H': H, 'M': M, 'O': O,
             }
+            key_points = self._validate_points(raw_points, w, h)
             result.key_points = key_points
             if 'radius' not in result.geo_info:
                 result.geo_info['radius'] = radius
@@ -493,22 +495,25 @@ class GeometryRecognizer:
 
         for i in range(num_samples):
             theta = 2 * math.pi * i / num_samples
-            x = int(cx + r * math.cos(theta))
-            y = int(cy + r * math.sin(theta))
-
-            # 在骨架图上检查半径 ±tol px 范围内是否有像素
+            # 在半径 ±tol px 范围内搜索是否有像素
             found = False
             for dr in range(-tol, tol + 1):
                 rx = int(cx + (r + dr) * math.cos(theta))
                 ry = int(cy + (r + dr) * math.sin(theta))
                 if 0 <= rx < w and 0 <= ry < h:
-                    # 同时检查骨架和二值图
                     if skeleton[ry, rx] > 0 or binary[ry, rx] > 0:
                         hit_count += 1
                         found = True
-                        break
-                if found:
-                    break
+                        break  # 只 break 内层 dr 循环
+            # 如果内层没找到，再用大一圈的容差扫一次
+            if not found and tol < 4:
+                for dr in range(-4, 5):
+                    rx = int(cx + (r + dr) * math.cos(theta))
+                    ry = int(cy + (r + dr) * math.sin(theta))
+                    if 0 <= rx < w and 0 <= ry < h:
+                        if skeleton[ry, rx] > 0 or binary[ry, rx] > 0:
+                            hit_count += 1
+                            break
 
         if num_samples == 0:
             return False
@@ -569,20 +574,85 @@ class GeometryRecognizer:
                     if self._point_on_segment(pt, p1, p2, 8) or self._point_on_segment(pt, p3, p4, 8):
                         intersections.append(pt)
 
-        if len(intersections) > 10:
-            cluster_pts = self._cluster_points(intersections, eps=15, min_samples=2)
-        else:
-            cluster_pts = intersections
+        # 自适应聚类：根据图像尺寸调整 eps
+        adaptive_eps = max(8, min(w, h) / 30)
+        cluster_pts = self._cluster_points(intersections, eps=adaptive_eps, min_samples=1)
 
+        if len(cluster_pts) < 3:
+            # 聚类失败，直接返回原始交点中得分最高的3个
+            logger.warning(f"  聚类后仅 {len(cluster_pts)} 个点，不足3个，使用原始交点")
+            cluster_pts = intersections
+            if len(cluster_pts) < 3:
+                logger.warning(f"  原始交点也仅 {len(cluster_pts)} 个，使用备选")
+                # 备选：从检测到的线段端点中取
+                for line in merged_lines:
+                    cluster_pts.append(line['p1'])
+                    cluster_pts.append(line['p2'])
+                cluster_pts = self._cluster_points(cluster_pts, eps=adaptive_eps, min_samples=1)
+
+        # 按 y 坐标排序，取 top 作为 A
         sorted_y = sorted(cluster_pts, key=lambda p: p[1])
         A = sorted_y[0]
 
-        bottom_candidates = sorted(cluster_pts, key=lambda p: -p[1])[:10]
-        bottom_candidates = [p for p in bottom_candidates if self._distance(p, A) > 80]
-        B = min(bottom_candidates, key=lambda p: p[0])
-        C = max(bottom_candidates, key=lambda p: p[0])
+        # 从剩余点中选 bottom 候选
+        rest = [p for p in cluster_pts if self._distance(p, A) > max(20, min(w, h) * 0.08)]
+        if len(rest) < 2:
+            rest = [p for p in cluster_pts if p != A]
+        if len(rest) < 2:
+            rest = cluster_pts[:3]
+
+        # 按 y 降序（最底部）取候选
+        bottom_sorted = sorted(rest, key=lambda p: -p[1])
+        B = min(bottom_sorted[:5], key=lambda p: p[0])  # 最左
+        C = max(bottom_sorted[:5], key=lambda p: p[0])  # 最右
+
+        # 确保 B != C
+        if self._distance(B, C) < max(20, min(w, h) * 0.05):
+            logger.warning("  B 和 C 太接近，调整选择")
+            # 从 rest 中排除 B 再选
+            rest2 = [p for p in rest if self._distance(p, B) > max(20, min(w, h) * 0.05)]
+            if len(rest2) >= 2:
+                C = max(rest2, key=lambda p: p[0])
 
         return A, B, C
+
+    def _validate_points(self, raw_points, img_w, img_h):
+        """验证几何点：裁剪到图像边界、移除退化点、保留有效点"""
+        margin = 5  # 边界留白
+        kept = {}
+        # 先保留 A, B, C（三角形顶点总是保留）
+        for name, pt in raw_points.items():
+            x = max(margin, min(img_w - margin, pt[0]))
+            y = max(margin, min(img_h - margin, pt[1]))
+            kept[name] = (x, y)
+
+        # 对于构造点 D, E, F, G, H, M：检查是否与已有顶点重合
+        # O 是 BC 中点，允许在 BC 上，不检查退化
+        base_names = ['A', 'B', 'C']
+        for name in ['D', 'E', 'F', 'G', 'H', 'M']:
+            if name not in kept:
+                continue
+            pt = kept[name]
+            # 检查是否与骨干顶点重合
+            degenerate = False
+            for base in base_names:
+                if base in kept and self._distance(pt, kept[base]) < 8:
+                    logger.debug(f"  点 {name} 与 {base} 重合（距离={self._distance(pt, kept[base]):.1f}px），标记为退化")
+                    degenerate = True
+                    break
+            if degenerate:
+                del kept[name]
+            else:
+                # 检查是否在图像边界内
+                x = max(margin, min(img_w - margin, pt[0]))
+                y = max(margin, min(img_h - margin, pt[1]))
+                kept[name] = (x, y)
+
+        logger.info(f"  几何点验证: 输入 {len(raw_points)} 个, 保留 {len(kept)} 个")
+        for name in sorted(kept.keys()):
+            if name not in ['A', 'B', 'C', 'O']:
+                logger.debug(f"    {name}=({kept[name][0]:.0f},{kept[name][1]:.0f})")
+        return kept
 
     # ============================================================
     # 线段验证
@@ -663,11 +733,16 @@ class GeometryRecognizer:
 
     def _generate_latex(self, kpts, radius, valid_connections=None, detected_circles=None):
         """生成 TikZ 代码（检测层 + 构造层 + 圆形）"""
-        A = kpts['A']; B = kpts['B']; C = kpts['C']
-        D = kpts['D']; E = kpts['E']; F = kpts['F']
-        G = kpts['G']; H = kpts['H']; M = kpts['M']; O = kpts['O']
+        # 安全获取关键点（可能被验证步骤移除）
+        A = kpts.get('A', (0, 0))
+        B = kpts.get('B', (0, 0))
+        C = kpts.get('C', (0, 0))
+        # 构造点可能不存在
+        construction_names = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'M', 'O']
+        all_pts = [kpts[n] for n in construction_names if n in kpts]
+        if not all_pts:
+            all_pts = [A, B, C]
 
-        all_pts = [A, B, C, D, E, F, G, H, M, O]
         xs = [p[0] for p in all_pts]
         ys = [p[1] for p in all_pts]
         min_x, max_x = min(xs), max(xs)
@@ -684,17 +759,6 @@ class GeometryRecognizer:
         def tx(px): return px * scale + offset_x
         def ty(py): return -(py * scale + offset_y)
 
-        # 圆弧角度（以BC为直径的半圆）
-        otx, oty = tx(O[0]), ty(O[1])
-        btx, bty = tx(B[0]), ty(B[1])
-        ctx, cty = tx(C[0]), ty(C[1])
-        start_angle = math.degrees(math.atan2(bty - oty, btx - otx))
-        end_angle = math.degrees(math.atan2(cty - oty, ctx - otx))
-        arc_start = end_angle
-        arc_end = start_angle
-        if arc_end < arc_start: arc_end += 360
-        tikz_r = radius * scale
-
         lines = []
         lines.append(r"\documentclass[tikz, border=10pt]{standalone}")
         lines.append(r"\usepackage{tikz}")
@@ -704,54 +768,74 @@ class GeometryRecognizer:
         lines.append(r"\begin{tikzpicture}[scale=1.0, >=stealth, line width=1.5pt]")
         lines.append("")
 
-        # 坐标
+        # 坐标（仅保留存在的点）
+        coord_names = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'M']
         lines.append("    % === 顶点坐标 ===")
-        for name in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'M']:
-            p = kpts[name]
-            lines.append(f"    \\coordinate ({name}) at ({tx(p[0]):.3f}, {ty(p[1]):.3f});")
+        for name in coord_names:
+            if name in kpts:
+                p = kpts[name]
+                lines.append(f"    \\coordinate ({name}) at ({tx(p[0]):.3f}, {ty(p[1]):.3f});")
         lines.append("")
 
-        # 检测到的圆形（如果有）
+        # 检测到的圆形
         if detected_circles:
             lines.append("    % === 检测到的圆形 ===")
             for i, (cx, cy, r) in enumerate(detected_circles):
                 tcx, tcy = tx(cx), ty(cy)
                 tr = r * scale
-                if tr > 0.1:  # 过滤太小的圆
+                if tr > 0.1:
                     lines.append(f"    \\draw[dashed, thick] ({tcx:.3f}, {tcy:.3f}) circle ({tr:.3f});")
             lines.append("")
 
-        # 半圆
-        lines.append("    % === 以BC为直径的半圆 ===")
-        lines.append(f"    \\draw[dashed] (C) arc ({arc_start:.1f}:{arc_end:.1f}:{tikz_r:.3f});")
-        lines.append("")
+        # 半圆（仅当 O 存在且有效时）
+        if 'O' in kpts and 'B' in kpts and 'C' in kpts and radius > 0:
+            lines.append("    % === 以BC为直径的半圆 ===")
+            otx, oty = tx(kpts['O'][0]), ty(kpts['O'][1])
+            btx, bty = tx(kpts['B'][0]), ty(kpts['B'][1])
+            ctx, cty = tx(kpts['C'][0]), ty(kpts['C'][1])
+            start_angle = math.degrees(math.atan2(bty - oty, btx - otx))
+            end_angle = math.degrees(math.atan2(cty - oty, ctx - otx))
+            arc_start = end_angle
+            arc_end = start_angle
+            if arc_end < arc_start: arc_end += 360
+            tikz_r = radius * scale
+            lines.append(f"    \\draw[dashed] (C) arc ({arc_start:.1f}:{arc_end:.1f}:{tikz_r:.3f});")
+            lines.append("")
 
-        # 检测层
+        # 检测层：图像验证的线段
         lines.append("    % === 检测层：图像验证的线段 ===")
         valid_set = set()
         for p1, p2, _ in (valid_connections or []):
-            valid_set.add(frozenset([p1, p2]))
+            if p1 in kpts and p2 in kpts:
+                valid_set.add(frozenset([p1, p2]))
         tri_edges = [frozenset(['A','B']), frozenset(['B','C']), frozenset(['C','A'])]
-        if all(e in valid_set for e in tri_edges):
+        tri_edges_valid = [e for e in tri_edges if e <= frozenset(kpts.keys())]
+        if all(e in valid_set for e in tri_edges_valid):
             lines.append("    \\draw[thick] (A) -- (B) -- (C) -- cycle;")
             lines.append("")
         else:
             for p1, p2 in [('A','B'), ('B','C'), ('C','A')]:
-                if frozenset([p1, p2]) in valid_set:
+                if p1 in kpts and p2 in kpts and frozenset([p1, p2]) in valid_set:
                     lines.append(f"    \\draw[thick] ({p1}) -- ({p2});")
             lines.append("")
         for p1, p2, _ in (valid_connections or []):
-            if frozenset([p1, p2]) in tri_edges: continue
-            lines.append(f"    \\draw ({p1}) -- ({p2});")
+            if p1 in kpts and p2 in kpts:
+                pair = frozenset([p1, p2])
+                if pair in tri_edges: continue
+                lines.append(f"    \\draw ({p1}) -- ({p2});")
         lines.append("")
 
-        # 构造层
-        lines.append("    % === 构造层：几何定义自动补全的辅助线 ===")
-        lines.append("    \\draw (D) -- (F);")
-        lines.append("    \\draw (E) -- (G);")
-        lines.append("    \\draw (D) -- (G);")
-        lines.append("    \\draw (E) -- (F);")
-        lines.append("")
+        # 构造层：仅当对应点都存在时才画
+        constr_pairs = [('D','F'), ('E','G'), ('D','G'), ('E','F')]
+        has_construction = any(
+            p1 in kpts and p2 in kpts for p1, p2 in constr_pairs
+        )
+        if has_construction:
+            lines.append("    % === 构造层：几何定义自动补全的辅助线 ===")
+            for p1, p2 in constr_pairs:
+                if p1 in kpts and p2 in kpts:
+                    lines.append(f"    \\draw ({p1}) -- ({p2});")
+            lines.append("")
 
         # 标注
         lines.append("    % === 顶点标注 ===")
@@ -759,7 +843,8 @@ class GeometryRecognizer:
                 'D': 'above left', 'E': 'above right',
                 'F': 'below', 'G': 'below', 'H': 'below', 'M': 'left'}
         for name, direction in dirs.items():
-            lines.append(f"    \\node[{direction}] at ({name}) {{{name}}};")
+            if name in kpts:
+                lines.append(f"    \\node[{direction}] at ({name}) {{{name}}};")
         lines.append("")
         lines.append(r"\end{tikzpicture}")
         lines.append(r"\end{document}")

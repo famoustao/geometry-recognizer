@@ -474,24 +474,24 @@ class MainWindow(QMainWindow):
         hit_layout.addWidget(hit_label)
         self.hit_slider = QSlider(Qt.Horizontal)
         self.hit_slider.setRange(10, 100)
-        self.hit_slider.setValue(50)
+        self.hit_slider.setValue(30)
         self.hit_slider.setTickPosition(QSlider.TicksBelow)
         self.hit_slider.setTickInterval(10)
         self.hit_slider.valueChanged.connect(self._on_hit_changed)
         hit_layout.addWidget(self.hit_slider, 1)
-        self.hit_value_label = QLabel("0.50")
+        self.hit_value_label = QLabel("0.30")
         self.hit_value_label.setFixedWidth(40)
         self.hit_value_label.setStyleSheet("font-size: 10px; font-weight: bold; color: #E65100;")
         hit_layout.addWidget(self.hit_value_label)
         circle_layout.addLayout(hit_layout)
 
-        self.hit_hint_label = QLabel("建议: 中等（均衡） (0.50)")
+        self.hit_hint_label = QLabel("建议: 中等偏低（适合手绘圆） (0.30)")
         self.hit_hint_label.setStyleSheet("font-size: 9px; color: #888; padding-left: 4px;")
         self.hit_hint_label.setWordWrap(True)
         circle_layout.addWidget(self.hit_hint_label)
 
         circle_layout.addSpacing(2)
-        reset_btn = QPushButton("恢复默认 (2px / 0.50)")
+        reset_btn = QPushButton("恢复默认 (2px / 0.30)")
         reset_btn.setStyleSheet("font-size: 9px; padding: 2px 8px;")
         reset_btn.clicked.connect(self._on_reset_circle_params)
         circle_layout.addWidget(reset_btn)
@@ -1362,10 +1362,10 @@ class MainWindow(QMainWindow):
     def _on_reset_circle_params(self):
         """恢复圆形检测参数为默认值"""
         self.tol_slider.setValue(2)
-        self.hit_slider.setValue(50)
+        self.hit_slider.setValue(30)
         self.tol_value_label.setText("2px")
-        self.hit_value_label.setText("0.50")
-        logger.info("圆形检测参数已恢复默认: 像素搜索半径=2px, 命中率阈值=0.50")
+        self.hit_value_label.setText("0.30")
+        logger.info("圆形检测参数已恢复默认: 像素搜索半径=2px, 命中率阈值=0.30")
 
     # ────────────────────────────────────────────────────
     # 析构
