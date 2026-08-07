@@ -81,8 +81,15 @@ class DeTikZifyRecognizer(GeometryRecognizer):
     """
 
     def __init__(self, model_name="nllg/detikzify-v2.5-8b", device_map="auto",
-                 torch_dtype="bfloat16", use_mcts=False, mcts_timeout=300):
-        super().__init__()
+                 torch_dtype="bfloat16", use_mcts=False, mcts_timeout=300,
+                 circle_pixel_tolerance=2, circle_hit_threshold=0.30,
+                 line_pixel_tolerance=8, line_hit_threshold=0.60):
+        super().__init__(
+            circle_pixel_tolerance=circle_pixel_tolerance,
+            circle_hit_threshold=circle_hit_threshold,
+            line_pixel_tolerance=line_pixel_tolerance,
+            line_hit_threshold=line_hit_threshold,
+        )
 
         if not DETIKZIFY_AVAILABLE:
             raise ImportError(
@@ -253,7 +260,9 @@ def create_recognizer(backend="auto", **kwargs):
         - "ai"   : 强制使用 AI（DeTikZify），不可用时抛异常
       **kwargs: 传递给具体识别器的参数
         circle_pixel_tolerance: 圆形像素搜索半径（默认 2）
-        circle_hit_threshold: 圆形命中率阈值（默认 0.50）
+        circle_hit_threshold: 圆形命中率阈值（默认 0.30）
+        line_pixel_tolerance: 直线像素匹配容差（默认 8）
+        line_hit_threshold: 直线命中率阈值（默认 0.60）
 
     返回:
       GeometryRecognizer 或 DeTikZifyRecognizer 实例

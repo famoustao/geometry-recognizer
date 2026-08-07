@@ -91,13 +91,17 @@ class RecognitionResult:
 class GeometryRecognizer:
     """几何图形识别引擎"""
 
-    def __init__(self, circle_pixel_tolerance=2, circle_hit_threshold=0.30):
+    def __init__(self, circle_pixel_tolerance=2, circle_hit_threshold=0.30,
+                 line_pixel_tolerance=8, line_hit_threshold=0.60):
         self.temp_dir = tempfile.mkdtemp(prefix="geo_recog_")
         self._setup_geometry_constraints()
-        self.circle_pixel_tolerance = circle_pixel_tolerance  # 像素搜索半径 ±N px
-        self.circle_hit_threshold = circle_hit_threshold      # 命中率阈值 0.0~1.0
+        self.circle_pixel_tolerance = circle_pixel_tolerance  # 圆形像素搜索半径 ±N px
+        self.circle_hit_threshold = circle_hit_threshold      # 圆形命中率阈值 0.0~1.0
+        self.line_pixel_tolerance = line_pixel_tolerance      # 直线像素匹配容差 px
+        self.line_hit_threshold = line_hit_threshold          # 直线命中率阈值 0.0~1.0
         logger.info(f"GeometryRecognizer 初始化完成，临时目录: {self.temp_dir}")
         logger.info(f"  圆形检测参数: 像素容差={self.circle_pixel_tolerance}px, 命中率阈值={self.circle_hit_threshold:.2f}")
+        logger.info(f"  直线检测参数: 像素容差={self.line_pixel_tolerance}px, 命中率阈值={self.line_hit_threshold:.2f}")
 
     def _setup_geometry_constraints(self):
         """几何约束表：每个点只连接几何定义中的相邻点"""
@@ -113,10 +117,13 @@ class GeometryRecognizer:
             'M': {'D', 'G', 'E', 'F'},
         }
 
-    def recognize(self, image_path, circle_pixel_tolerance=None, circle_hit_threshold=None):
+    def recognize(self, image_path, circle_pixel_tolerance=None, circle_hit_threshold=None,
+                  line_pixel_tolerance=None, line_hit_threshold=None):
         """执行完整识别流程，返回 RecognitionResult
         circle_pixel_tolerance: 覆盖实例的圆形像素搜索半径（可选）
         circle_hit_threshold: 覆盖实例的圆形命中率阈值（可选）
+        line_pixel_tolerance: 覆盖实例的直线像素匹配容差（可选）
+        line_hit_threshold: 覆盖实例的直线命中率阈值（可选）
         """
         result = RecognitionResult()
         result.image_path = image_path
@@ -130,6 +137,10 @@ class GeometryRecognizer:
                 self.circle_pixel_tolerance = circle_pixel_tolerance
             if circle_hit_threshold is not None:
                 self.circle_hit_threshold = circle_hit_threshold
+            if line_pixel_tolerance is not None:
+                self.line_pixel_tolerance = line_pixel_tolerance
+            if line_hit_threshold is not None:
+                self.line_hit_threshold = line_hit_threshold
 
             img = safe_imread(image_path)
             if img is None:
@@ -661,6 +672,8 @@ class GeometryRecognizer:
     def _detect_line_connections(self, gray_original, key_points, detected_lines):
         """通过几何约束表 + 连通性验证 + Hough匹配 验证线段连接"""
         h, w = gray_original.shape
+        tol = self.line_pixel_tolerance        # 直线像素匹配容差
+        hit_thresh = self.line_hit_threshold   # 直线命中率阈值
 
         hough_segments = [(line['p1'], line['p2']) for line in detected_lines]
 
@@ -682,7 +695,7 @@ class GeometryRecognizer:
                         cur_run = 0
             return max_run, total_dark / max(total_samples, 1), total_samples
 
-        def segment_on_hough_multi(p1, p2, num_samples=5, tolerance=8):
+        def segment_on_hough_multi(p1, p2, num_samples=5):
             seg_len = self._distance(p1, p2)
             if seg_len < 5: return False
             for hp1, hp2 in hough_segments:
@@ -703,8 +716,8 @@ class GeometryRecognizer:
                     elif t_h > 1: fx, fy = hp2
                     else: fx, fy = hp1[0]+t_h*abx, hp1[1]+t_h*aby
                     d = math.sqrt((px-fx)**2 + (py-fy)**2)
-                    if d < tolerance: close_count += 1
-                if close_count >= num_samples * 0.6: return True
+                    if d < tol: close_count += 1
+                if close_count >= num_samples * hit_thresh: return True
             return False
 
         valid = []
@@ -722,7 +735,7 @@ class GeometryRecognizer:
                 max_run, pixel_ratio, _ = longest_dark_run(p1, p2)
                 run_ratio = max_run / max(seg_len, 1)
                 on_hough = segment_on_hough_multi(p1, p2)
-                if run_ratio > 0.15 or on_hough or pixel_ratio > 0.40:
+                if run_ratio > hit_thresh * 0.25 or on_hough or pixel_ratio > hit_thresh * 0.67:
                     confidence = max(run_ratio * 100, pixel_ratio * 100, 70 if on_hough else 0)
                     valid.append((name1, name2, confidence))
         return valid

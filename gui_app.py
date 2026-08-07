@@ -151,12 +151,15 @@ class RecognizeWorker(QThread):
     progress = Signal(str, int)     # message, percent
 
     def __init__(self, image_path, backend="cv", parent=None,
-                 circle_pixel_tolerance=2, circle_hit_threshold=0.50):
+                 circle_pixel_tolerance=2, circle_hit_threshold=0.30,
+                 line_pixel_tolerance=8, line_hit_threshold=0.60):
         super().__init__(parent)
         self.image_path = image_path
         self.backend = backend
         self.circle_pixel_tolerance = circle_pixel_tolerance
         self.circle_hit_threshold = circle_hit_threshold
+        self.line_pixel_tolerance = line_pixel_tolerance
+        self.line_hit_threshold = line_hit_threshold
 
     def run(self):
         try:
@@ -164,9 +167,15 @@ class RecognizeWorker(QThread):
                 backend=self.backend,
                 circle_pixel_tolerance=self.circle_pixel_tolerance,
                 circle_hit_threshold=self.circle_hit_threshold,
+                line_pixel_tolerance=self.line_pixel_tolerance,
+                line_hit_threshold=self.line_hit_threshold,
             )
             self.progress.emit(f"识别中: {os.path.basename(self.image_path)}...", 30)
-            result = recognizer.recognize(self.image_path)
+            result = recognizer.recognize(
+                self.image_path,
+                line_pixel_tolerance=self.line_pixel_tolerance,
+                line_hit_threshold=self.line_hit_threshold,
+            )
             self.progress.emit(f"编译中: {os.path.basename(self.image_path)}...", 80)
             recognizer.cleanup()
             self.finished.emit(self.image_path, result)
@@ -497,6 +506,65 @@ class MainWindow(QMainWindow):
         circle_layout.addWidget(reset_btn)
 
         layout.addWidget(circle_group)
+
+        # ── 直线检测参数滑块 ──
+        line_group = QGroupBox("📏 直线检测参数")
+        line_layout = QVBoxLayout(line_group)
+        line_layout.setSpacing(2)
+
+        # 像素匹配容差
+        line_tol_layout = QHBoxLayout()
+        line_tol_label = QLabel("像素匹配容差:")
+        line_tol_label.setStyleSheet("font-size: 10px;")
+        line_tol_layout.addWidget(line_tol_label)
+        self.line_tol_slider = QSlider(Qt.Horizontal)
+        self.line_tol_slider.setRange(1, 20)
+        self.line_tol_slider.setValue(8)
+        self.line_tol_slider.setTickPosition(QSlider.TicksBelow)
+        self.line_tol_slider.setTickInterval(2)
+        self.line_tol_slider.valueChanged.connect(self._on_line_tol_changed)
+        line_tol_layout.addWidget(self.line_tol_slider, 1)
+        self.line_tol_value_label = QLabel("8px")
+        self.line_tol_value_label.setFixedWidth(40)
+        self.line_tol_value_label.setStyleSheet("font-size: 10px; font-weight: bold; color: #1565C0;")
+        line_tol_layout.addWidget(self.line_tol_value_label)
+        line_layout.addLayout(line_tol_layout)
+
+        self.line_tol_hint_label = QLabel("建议: 标准打印图形 (8px)")
+        self.line_tol_hint_label.setStyleSheet("font-size: 9px; color: #888; padding-left: 4px;")
+        self.line_tol_hint_label.setWordWrap(True)
+        line_layout.addWidget(self.line_tol_hint_label)
+
+        # 命中率阈值
+        line_hit_layout = QHBoxLayout()
+        line_hit_label = QLabel("命中率阈值:")
+        line_hit_label.setStyleSheet("font-size: 10px;")
+        line_hit_layout.addWidget(line_hit_label)
+        self.line_hit_slider = QSlider(Qt.Horizontal)
+        self.line_hit_slider.setRange(10, 100)
+        self.line_hit_slider.setValue(60)
+        self.line_hit_slider.setTickPosition(QSlider.TicksBelow)
+        self.line_hit_slider.setTickInterval(10)
+        self.line_hit_slider.valueChanged.connect(self._on_line_hit_changed)
+        line_hit_layout.addWidget(self.line_hit_slider, 1)
+        self.line_hit_value_label = QLabel("0.60")
+        self.line_hit_value_label.setFixedWidth(40)
+        self.line_hit_value_label.setStyleSheet("font-size: 10px; font-weight: bold; color: #E65100;")
+        line_hit_layout.addWidget(self.line_hit_value_label)
+        line_layout.addLayout(line_hit_layout)
+
+        self.line_hit_hint_label = QLabel("建议: 中等（均衡） (0.60)")
+        self.line_hit_hint_label.setStyleSheet("font-size: 9px; color: #888; padding-left: 4px;")
+        self.line_hit_hint_label.setWordWrap(True)
+        line_layout.addWidget(self.line_hit_hint_label)
+
+        line_layout.addSpacing(2)
+        line_reset_btn = QPushButton("恢复默认 (8px / 0.60)")
+        line_reset_btn.setStyleSheet("font-size: 9px; padding: 2px 8px;")
+        line_reset_btn.clicked.connect(self._on_reset_line_params)
+        line_layout.addWidget(line_reset_btn)
+
+        layout.addWidget(line_group)
 
         return panel
 
@@ -1036,13 +1104,18 @@ class MainWindow(QMainWindow):
         # 读取滑块参数
         tol = self.tol_slider.value()
         hit = self.hit_slider.value() / 100.0
+        line_tol = self.line_tol_slider.value()
+        line_hit = self.line_hit_slider.value() / 100.0
         logger.info(f"  圆形检测参数: 像素搜索半径={tol}px, 命中率阈值={hit:.2f}")
+        logger.info(f"  直线检测参数: 像素匹配容差={line_tol}px, 命中率阈值={line_hit:.2f}")
 
         # 启动线程
         worker = RecognizeWorker(
             path, backend=backend,
             circle_pixel_tolerance=tol,
             circle_hit_threshold=hit,
+            line_pixel_tolerance=line_tol,
+            line_hit_threshold=line_hit,
         )
         worker.finished.connect(self._on_recognize_finished)
         worker.progress.connect(self._on_recognize_progress)
@@ -1366,6 +1439,77 @@ class MainWindow(QMainWindow):
         self.tol_value_label.setText("2px")
         self.hit_value_label.setText("0.30")
         logger.info("圆形检测参数已恢复默认: 像素搜索半径=2px, 命中率阈值=0.30")
+
+    # ────────────────────────────────────────────────────
+    # 直线检测参数滑块回调
+    # ────────────────────────────────────────────────────
+
+    def _on_line_tol_changed(self, value):
+        """直线像素匹配容差滑块变化"""
+        self.line_tol_value_label.setText(f"{value}px")
+        hint_text = self._get_line_tol_hint(value)
+        self.line_tol_hint_label.setText(f"建议: {hint_text} ({value}px)")
+        # 颜色渐变提示
+        if value <= 5:
+            self.line_tol_hint_label.setStyleSheet("font-size: 9px; color: #4CAF50; padding-left: 4px;")
+        elif value <= 10:
+            self.line_tol_hint_label.setStyleSheet("font-size: 9px; color: #FF9800; padding-left: 4px;")
+        else:
+            self.line_tol_hint_label.setStyleSheet("font-size: 9px; color: #F44336; padding-left: 4px;")
+        logger.debug(f"直线像素匹配容差调整为: {value}px ({hint_text})")
+
+    def _get_line_tol_hint(self, value):
+        """根据直线像素匹配容差返回建议文本"""
+        if value <= 3:
+            return "精确图形/扫描图"
+        elif value <= 5:
+            return "标准打印图形"
+        elif value <= 8:
+            return "手绘图形"
+        elif value <= 12:
+            return "较粗糙手绘图"
+        else:
+            return "严重失真/模糊图"
+
+    def _on_line_hit_changed(self, value):
+        """直线命中率阈值滑块变化"""
+        val = value / 100.0
+        self.line_hit_value_label.setText(f"{val:.2f}")
+        hint_text = self._get_line_hit_hint(val)
+        self.line_hit_hint_label.setText(f"建议: {hint_text} ({val:.2f})")
+        # 颜色渐变提示
+        if val >= 0.70:
+            self.line_hit_hint_label.setStyleSheet("font-size: 9px; color: #4CAF50; padding-left: 4px;")
+        elif val >= 0.50:
+            self.line_hit_hint_label.setStyleSheet("font-size: 9px; color: #FF9800; padding-left: 4px;")
+        else:
+            self.line_hit_hint_label.setStyleSheet("font-size: 9px; color: #F44336; padding-left: 4px;")
+        logger.debug(f"直线命中率阈值调整为: {val:.2f} ({hint_text})")
+
+    def _get_line_hit_hint(self, value):
+        """根据直线命中率阈值返回建议文本"""
+        if value < 0.20:
+            return "宽松检测（易误检）"
+        elif value < 0.35:
+            return "低阈值（适合模糊手绘）"
+        elif value < 0.50:
+            return "中等偏低（适合手绘）"
+        elif value < 0.60:
+            return "中等（均衡）"
+        elif value < 0.70:
+            return "中等偏高（适合打印图）"
+        elif value < 0.85:
+            return "严格（仅清晰线段）"
+        else:
+            return "极严格（仅完美直线）"
+
+    def _on_reset_line_params(self):
+        """恢复直线检测参数为默认值"""
+        self.line_tol_slider.setValue(8)
+        self.line_hit_slider.setValue(60)
+        self.line_tol_value_label.setText("8px")
+        self.line_hit_value_label.setText("0.60")
+        logger.info("直线检测参数已恢复默认: 像素匹配容差=8px, 命中率阈值=0.60")
 
     # ────────────────────────────────────────────────────
     # 析构
