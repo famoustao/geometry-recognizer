@@ -226,7 +226,7 @@ def _subprocess_recognize(image_path, backend, circle_tol, circle_hit, line_tol,
 # ═══════════════════════════════════════════════════════════════
 
 class RecognizeWorker(QThread):
-    finished = Signal(str, object)  # image_path, RecognitionResult
+    recognition_finished = Signal(str, object)  # image_path, RecognitionResult
     progress = Signal(str, int)     # message, percent
 
     def __init__(self, image_path, backend="cv", parent=None,
@@ -301,14 +301,14 @@ class RecognizeWorker(QThread):
                     result = r
 
             self.progress.emit(f"编译中: {os.path.basename(self.image_path)}...", 80)
-            self.finished.emit(self.image_path, result)
+            self.recognition_finished.emit(self.image_path, result)
 
         except Exception as e:
             logger.error(f"识别工作线程异常: {type(e).__name__}: {str(e)}")
             logger.error(traceback.format_exc())
             result = RecognitionResult()
             result.error = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
-            self.finished.emit(self.image_path, result)
+            self.recognition_finished.emit(self.image_path, result)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1061,29 +1061,31 @@ class MainWindow(QMainWindow):
                 self.preview_label.size(), Qt.KeepAspectRatio,
                 Qt.SmoothTransformation
             )
-            # 在图片上叠加顶点标注
-            if path in self.results and self.results[path].success:
-                # 使用 Pixmap 绘制标注
-                result = self.results[path]
-                painter = QPainter(scaled)
-                painter.setRenderHint(QPainter.Antialiasing)
-                # 缩放因子
-                sx = scaled.width() / pixmap.width()
-                sy = scaled.height() / pixmap.height()
-                for name, pt in result.key_points.items():
-                    if name == 'O':
-                        continue
-                    x, y = int(pt[0] * sx), int(pt[1] * sy)
-                    # 红色圆点
-                    painter.setPen(QPen(QColor("#FF5722"), 3))
-                    painter.setBrush(QBrush(QColor("#FF5722")))
-                    painter.drawEllipse(x-4, y-4, 8, 8)
-                    # 标签
-                    painter.setPen(QPen(QColor("#FF5722"), 1))
-                    font = QFont("sans-serif", 10, QFont.Weight.Bold)
-                    painter.setFont(font)
-                    painter.drawText(x+8, y-6, name)
-                painter.end()
+            # 在图片上叠加顶点标注（安全模式：QPainter 异常不闪退）
+            if path in self.results and self.results[path].success and not scaled.isNull():
+                try:
+                    result = self.results[path]
+                    painter = QPainter(scaled)
+                    painter.setRenderHint(QPainter.Antialiasing)
+                    # 缩放因子
+                    sx = scaled.width() / pixmap.width()
+                    sy = scaled.height() / pixmap.height()
+                    for name, pt in result.key_points.items():
+                        if name == 'O':
+                            continue
+                        x, y = int(pt[0] * sx), int(pt[1] * sy)
+                        # 红色圆点
+                        painter.setPen(QPen(QColor("#FF5722"), 3))
+                        painter.setBrush(QBrush(QColor("#FF5722")))
+                        painter.drawEllipse(x-4, y-4, 8, 8)
+                        # 标签
+                        painter.setPen(QPen(QColor("#FF5722"), 1))
+                        font = QFont("sans-serif", 10, QFont.Weight.Bold)
+                        painter.setFont(font)
+                        painter.drawText(x+8, y-6, name)
+                    painter.end()
+                except Exception as e:
+                    logger.warning(f"QPainter 标注绘制失败: {e}")
 
             self.preview_label.setPixmap(scaled)
         else:
@@ -1243,7 +1245,7 @@ class MainWindow(QMainWindow):
             line_pixel_tolerance=line_tol,
             line_hit_threshold=line_hit,
         )
-        worker.finished.connect(self._on_recognize_finished)
+        worker.recognition_finished.connect(self._on_recognize_finished)
         worker.progress.connect(self._on_recognize_progress)
         self.recognizer_pool[path] = worker
         worker.start()
