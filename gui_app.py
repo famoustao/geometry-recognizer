@@ -154,18 +154,24 @@ def _subprocess_recognize(image_path, backend, circle_tol, circle_hit, line_tol,
     在独立子进程中运行识别（用文件传递结果，避免 mp.Queue 在 PyInstaller 下的问题）
     即使 OpenCV 内部崩溃也不会影响 GUI 进程
     """
+    # ── 先导入（必须在 try 外，确保 except 块也能引用） ──
+    import sys
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, script_dir)
+
+    from geometry_app import create_recognizer, RecognitionResult
+    from geometry_app.logger import logger, flush_log
+
+    # ── faulthandler 写入文件而非 stderr（PyInstaller 子进程中 stderr 为 None） ──
     try:
-        # 子进程需要重新设置路径
-        import sys
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        sys.path.insert(0, script_dir)
+        import faulthandler
+        crash_fd_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash_faulthandler_child.log")
+        crash_fd = open(crash_fd_path, "a")
+        faulthandler.enable(file=crash_fd)
+    except Exception:
+        pass  # faulthandler 非必需，跳过即可
 
-        # 启用 faulthandler 在子进程中也捕获 segfault
-        faulthandler.enable()
-
-        from geometry_app import create_recognizer, RecognitionResult
-        from geometry_app.logger import logger, flush_log
-
+    try:
         logger.info(f"子进程启动: 识别 {image_path}")
         flush_log()
 
@@ -205,7 +211,7 @@ def _subprocess_recognize(image_path, backend, circle_tol, circle_hit, line_tol,
                 f.write(f"{'='*60}\n")
         except Exception:
             pass
-        # 异常也写入文件
+        # 异常也写入文件（RecognitionResult 已在 try 外导入，确保可用）
         result = RecognitionResult()
         result.error = f"{type(e).__name__}: {str(e)}\n{tb}"
         try:
