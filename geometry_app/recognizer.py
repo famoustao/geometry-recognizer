@@ -14,7 +14,7 @@ import shutil
 import traceback
 from PIL import Image
 
-from .logger import logger, log_exception
+from .logger import logger, log_exception, flush_log
 
 
 def safe_imread(image_path):
@@ -152,13 +152,26 @@ class GeometryRecognizer:
             h, w = img.shape[:2]
             result.image_size = (w, h)
             logger.info(f"图片尺寸: {w}x{h}, 通道数: {img.shape[2]}")
+            flush_log()
 
             original_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            logger.info("original_gray 转换完成")
+            flush_log()
 
             # 0. 预处理：文字屏蔽 → 二值化 → 骨架化
             logger.info("步骤0/8: 图像预处理（文字屏蔽 + 二值化 + 骨架化）...")
-            cleaned, gray, binary, skeleton = self._preprocess(img)
-            logger.info("  预处理完成")
+            flush_log()
+            try:
+                cleaned, gray, binary, skeleton = self._preprocess(img)
+                logger.info("  预处理完成")
+                flush_log()
+            except Exception as e:
+                tb = traceback.format_exc()
+                logger.error(f"预处理异常: {type(e).__name__}: {str(e)}")
+                logger.error(tb)
+                flush_log()
+                result.error = f"预处理失败: {type(e).__name__}: {str(e)}"
+                return result
 
             # 保存调试图
             debug_dir = os.path.join(self.temp_dir, "debug")
@@ -167,32 +180,64 @@ class GeometryRecognizer:
             cv2.imwrite(os.path.join(debug_dir, "02_skeleton.png"), skeleton)
             result.debug_images['binary'] = os.path.join(debug_dir, "01_binary.png")
             result.debug_images['skeleton'] = os.path.join(debug_dir, "02_skeleton.png")
+            logger.info("  调试图保存完成")
+            flush_log()
 
             # 1. 线条检测（使用骨架图增强）
             logger.info("步骤1/8: 线条检测（Canny + 骨架）...")
-            merged_lines = self._detect_lines(gray, skeleton, w, h)
-            logger.info(f"  检测到 {len(merged_lines)} 条线段（去重后）")
+            flush_log()
+            try:
+                merged_lines = self._detect_lines(gray, skeleton, w, h)
+                logger.info(f"  检测到 {len(merged_lines)} 条线段（去重后）")
+                flush_log()
+            except Exception as e:
+                tb = traceback.format_exc()
+                logger.error(f"线条检测异常: {type(e).__name__}: {str(e)}")
+                logger.error(tb)
+                flush_log()
+                merged_lines = []
 
             # 2. 圆形检测（新增）
             logger.info("步骤2/8: 圆形检测...")
-            detected_circles = self._detect_circles(gray, binary, skeleton, w, h)
-            if detected_circles:
-                logger.info(f"  检测到 {len(detected_circles)} 个圆形")
-                result.geo_info['circles'] = detected_circles
-            else:
-                logger.info("  未检测到完整圆形")
+            flush_log()
+            try:
+                detected_circles = self._detect_circles(gray, binary, skeleton, w, h)
+                if detected_circles:
+                    logger.info(f"  检测到 {len(detected_circles)} 个圆形")
+                    result.geo_info['circles'] = detected_circles
+                else:
+                    logger.info("  未检测到完整圆形")
+                flush_log()
+            except Exception as e:
+                tb = traceback.format_exc()
+                logger.error(f"圆形检测异常: {type(e).__name__}: {str(e)}")
+                logger.error(tb)
+                flush_log()
+                detected_circles = []
 
             # 3. 直线交点分析 → 找三角形顶点
             logger.info("步骤3/8: 直线交点分析...")
-            A, B, C = self._find_triangle_vertices(merged_lines, gray, w, h)
-            logger.info(f"  A({A[0]:.0f},{A[1]:.0f}) B({B[0]:.0f},{B[1]:.0f}) C({C[0]:.0f},{C[1]:.0f})")
+            flush_log()
+            try:
+                A, B, C = self._find_triangle_vertices(merged_lines, gray, w, h)
+                logger.info(f"  A({A[0]:.0f},{A[1]:.0f}) B({B[0]:.0f},{B[1]:.0f}) C({C[0]:.0f},{C[1]:.0f})")
+                flush_log()
+            except Exception as e:
+                tb = traceback.format_exc()
+                logger.error(f"三角形顶点检测异常: {type(e).__name__}: {str(e)}")
+                logger.error(tb)
+                flush_log()
+                result.error = f"顶点检测失败: {type(e).__name__}: {str(e)}"
+                return result
 
             # 4. 计算几何点
             logger.info("步骤4/8: 计算几何点...")
+            flush_log()
             O = ((B[0] + C[0]) / 2, (B[1] + C[1]) / 2)
             radius = self._distance(O, B)
             H = self._perpendicular_foot(A, B, C)
             logger.info(f"  O=({O[0]:.0f},{O[1]:.0f}) R={radius:.0f} H=({H[0]:.0f},{H[1]:.0f})")
+            flush_log()
 
             D = self._line_circle_intersection(A, B, O, radius)
             if D is None:
@@ -212,6 +257,7 @@ class GeometryRecognizer:
             D = self._refine_to_dark_pixel(D, O, radius, gray, w, h)
             E = self._refine_to_dark_pixel(E, O, radius, gray, w, h)
             logger.info(f"  D=({D[0]:.0f},{D[1]:.0f}) E=({E[0]:.0f},{E[1]:.0f})")
+            flush_log()
 
             F = self._perpendicular_foot(D, B, C)
             G = self._perpendicular_foot(E, B, C)
@@ -237,36 +283,51 @@ class GeometryRecognizer:
 
             # 5. 验证线段连接
             logger.info("步骤5/8: 验证线段连接...")
-            valid_connections = self._detect_line_connections(
-                original_gray, key_points, merged_lines)
-            result.valid_connections = valid_connections
-            logger.info(f"  验证通过: {len(valid_connections)} 条")
-            for p1, p2, c in valid_connections:
-                logger.info(f"    {p1}-{p2}: {c:.0f}%")
+            flush_log()
+            try:
+                valid_connections = self._detect_line_connections(
+                    original_gray, key_points, merged_lines)
+                result.valid_connections = valid_connections
+                logger.info(f"  验证通过: {len(valid_connections)} 条")
+                for p1, p2, c in valid_connections:
+                    logger.info(f"    {p1}-{p2}: {c:.0f}%")
+                flush_log()
+            except Exception as e:
+                tb = traceback.format_exc()
+                logger.error(f"线段验证异常: {type(e).__name__}: {str(e)}")
+                logger.error(tb)
+                flush_log()
+                result.valid_connections = []
 
             # 6. 生成 TikZ 代码
             logger.info("步骤6/8: 生成 TikZ 代码...")
+            flush_log()
             result.tex_code = self._generate_latex(key_points, radius, valid_connections,
                                                     detected_circles)
             tex_lines = result.tex_code.count('\n') + 1
             logger.info(f"  TikZ 代码生成完成: {tex_lines} 行")
+            flush_log()
 
             # 7. 编译预览图
             logger.info("步骤7/8: 编译 LaTeX 预览图...")
+            flush_log()
             preview_path = self._compile_to_png(result.tex_code)
             result.preview_image_path = preview_path
             if preview_path and os.path.exists(preview_path):
                 logger.info(f"  预览图生成成功: {preview_path}")
             else:
                 logger.warning("  预览图生成失败（可能缺少 LaTeX 环境）")
+            flush_log()
 
             # 8. 保存调试图
             logger.info("步骤8/8: 保存调试图...")
+            flush_log()
             self._draw_debug_image(img, merged_lines, key_points, detected_circles, debug_dir)
 
             result.success = True
             logger.info(f"{'='*50}")
             logger.info(f"识别完成: {image_path}")
+            flush_log()
             return result
 
         except Exception as e:
@@ -274,6 +335,7 @@ class GeometryRecognizer:
             tb = traceback.format_exc()
             logger.error(f"识别过程异常: {type(e).__name__}: {str(e)}")
             logger.error(tb)
+            flush_log()
             result.error = f"{type(e).__name__}: {str(e)}\n{tb}"
             return result
 
