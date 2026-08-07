@@ -112,17 +112,26 @@ def get_logger(name="geometry_recog"):
 
     logger.info(f"日志文件: {log_file}")
     logger.info(f"程序目录: {PROGRAM_DIR}")
-    flush_log()
-    return logger
-
-
-def flush_log():
-    """强制刷新所有日志处理器，确保日志立即写入磁盘"""
+    # 直接刷新 handler，避免引用尚未定义好的全局 logger
     for handler in logger.handlers:
         try:
             handler.flush()
         except Exception:
             pass
+    return logger
+
+
+def flush_log():
+    """强制刷新所有日志处理器，确保日志立即写入磁盘"""
+    global logger
+    try:
+        for handler in logger.handlers:
+            try:
+                handler.flush()
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 # 全局默认日志器
