@@ -1,0 +1,59 @@
+name: 自动清理旧 Action 记录
+
+on:
+  schedule:
+    # 每天凌晨 3:00 运行一次
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: '保留最近几次运行记录'
+        required: true
+        default: '3'
+        type: number
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: 查询并清理旧记录（保留最近 3 条）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP: ${{ github.event.inputs.keep || 3 }}
+        run: |
+          echo "=== 保留最近 $KEEP 条记录 ==="
+          REPO="${{ github.repository }}"
+
+          # 获取所有 workflow 的文件名
+          WORKFLOWS=$(gh api "/repos/$REPO/actions/workflows" --jq '.workflows[] | .name' | sort)
+
+          while IFS= read -r WF_NAME; do
+            [ -z "$WF_NAME" ] && continue
+            echo "--- 处理 workflow: $WF_NAME ---"
+
+            # 获取该 workflow 的所有运行记录 ID，按创建时间降序
+            RUN_IDS=$(gh api "/repos/$REPO/actions/workflows/$(echo $WF_NAME | jq -sRr @uri)/runs" \
+              --jq '[.workflow_runs[] | select(.conclusion != "cancelled") | .id] | reverse')
+
+            TOTAL=$(echo "$RUN_IDS" | jq 'length')
+            echo "  总运行次数: $TOTAL"
+
+            # 保留最近 KEEP 条，删除其余
+            TO_DELETE=$(echo "$RUN_IDS" | jq ".[:-($KEEP)]" | jq -r '.[]')
+
+            COUNT=0
+            for ID in $TO_DELETE; do
+              [ -z "$ID" ] && continue
+              echo "  删除运行记录 #$ID"
+              gh api -X DELETE "/repos/$REPO/actions/runs/$ID" --silent
+              COUNT=$((COUNT + 1))
+            done
+
+            echo "  已清理 $COUNT 条记录"
+          done <<< "$WORKFLOWS"
+
+          echo "=== 清理完成 ==="
