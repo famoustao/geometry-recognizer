@@ -761,26 +761,26 @@ class GeometryRecognizer:
             seg_len = self._distance(p1, p2)
             if seg_len < 5: return False
             for hp1, hp2 in hough_segments:
-                seg_angle = math.atan2(p2[1]-p1[1], p2[0]-p1[0])
-                hough_angle = math.atan2(hp2[1]-hp1[1], hp2[0]-hp1[0])
-                ang_diff = abs(seg_angle - hough_angle)
-                ang_diff = min(ang_diff, 2*math.pi - ang_diff)
-                if ang_diff > math.radians(30): continue
+                abx, aby = hp2[0]-hp1[0], hp2[1]-hp1[1]
+                line_len = math.sqrt(abx*abx + aby*aby)
+                if line_len < 1: continue
+                # 用点到无限直线的距离，而不是到线段的投影
+                # 这样即使 Hough 检测到的线段比实际短，也能匹配
+                nx, ny = -aby/line_len, abx/line_len  # 单位法向量
                 close_count = 0
                 for i in range(num_samples):
                     t = (i + 0.5) / num_samples
                     px = p1[0] + t * (p2[0] - p1[0])
                     py = p1[1] + t * (p2[1] - p1[1])
-                    abx, aby = hp2[0]-hp1[0], hp2[1]-hp1[1]
-                    apx, apy = px-hp1[0], py-hp1[1]
-                    t_h = (apx*abx + apy*aby) / max(abx*abx + aby*aby, 1e-8)
-                    if t_h < 0: fx, fy = hp1
-                    elif t_h > 1: fx, fy = hp2
-                    else: fx, fy = hp1[0]+t_h*abx, hp1[1]+t_h*aby
-                    d = math.sqrt((px-fx)**2 + (py-fy)**2)
+                    d = abs((px-hp1[0])*nx + (py-hp1[1])*ny)  # 点到直线距离
                     if d < tol: close_count += 1
-                if close_count >= num_samples * hit_thresh: return True
+                if close_count >= num_samples * hit_thresh:
+                    return True
             return False
+
+        # 三角形边（A-B, B-C, C-A）特殊处理：
+        # 即使像素扫描不完美，只要 Hough 检测支持就通过
+        tri_edge_names = {frozenset(['A','B']), frozenset(['B','C']), frozenset(['C','A'])}
 
         valid = []
         tested_pairs = set()
@@ -797,8 +797,14 @@ class GeometryRecognizer:
                 max_run, pixel_ratio, _ = longest_dark_run(p1, p2)
                 run_ratio = max_run / max(seg_len, 1)
                 on_hough = segment_on_hough_multi(p1, p2)
+                is_tri_edge = pair in tri_edge_names
                 if run_ratio > hit_thresh * 0.25 or on_hough or pixel_ratio > hit_thresh * 0.67:
                     confidence = max(run_ratio * 100, pixel_ratio * 100, 70 if on_hough else 0)
+                    valid.append((name1, name2, confidence))
+                elif is_tri_edge and pixel_ratio > 0.05:
+                    # 三角形边特殊处理：即使像素扫描弱，只要有 Hough 支持或少量暗像素就通过
+                    logger.debug(f"  [{name1}-{name2}] 三角形边放宽: pixel_ratio={pixel_ratio:.2f}, on_hough={on_hough}")
+                    confidence = max(pixel_ratio * 100, 30 if on_hough else 0)
                     valid.append((name1, name2, confidence))
         return valid
 
@@ -1030,6 +1036,9 @@ class GeometryRecognizer:
 
     @staticmethod
     def _line_circle_intersection(p1, p2, center, R):
+        """直线与圆的交点
+        返回圆外的交点（优先取不在线段端点上的交点）
+        """
         v = (p2[0]-p1[0], p2[1]-p1[1])
         w = (p1[0]-center[0], p1[1]-center[1])
         a = v[0]**2 + v[1]**2
@@ -1037,12 +1046,35 @@ class GeometryRecognizer:
         c = w[0]**2 + w[1]**2 - R**2
         disc = b*b - 4*a*c
         if disc < 0: return None
-        t1 = (-b + math.sqrt(disc)) / (2*a)
-        t2 = (-b - math.sqrt(disc)) / (2*a)
-        if 0 <= t1 <= 1 and 0 <= t2 <= 1: t = max(t1, t2)
-        elif 0 <= t1 <= 1: t = t1
-        elif 0 <= t2 <= 1: t = t2
-        else: return None
+        sqrt_disc = math.sqrt(disc)
+        t1 = (-b + sqrt_disc) / (2*a)
+        t2 = (-b - sqrt_disc) / (2*a)
+
+        # 判断两个交点是否在端点附近（p1=0, p2=1）
+        t1_at_end = abs(t1) < 0.02 or abs(t1 - 1) < 0.02
+        t2_at_end = abs(t2) < 0.02 or abs(t2 - 1) < 0.02
+
+        # 如果一个交点在端点，取另一个交点（即使在线段延长线上）
+        if t1_at_end and not t2_at_end:
+            if -0.5 <= t2 <= 1.5:
+                return (p1[0] + t2*v[0], p1[1] + t2*v[1])
+        if t2_at_end and not t1_at_end:
+            if -0.5 <= t1 <= 1.5:
+                return (p1[0] + t1*v[0], p1[1] + t1*v[1])
+
+        # 两个交点都在线段内或附近
+        if 0 <= t1 <= 1 and 0 <= t2 <= 1:
+            # 取离端点更远的那个（避免取到端点本身）
+            if abs(t1 - 0.5) > abs(t2 - 0.5):
+                t = t1
+            else:
+                t = t2
+        elif 0 <= t1 <= 1:
+            t = t1
+        elif 0 <= t2 <= 1:
+            t = t2
+        else:
+            return None
         return (p1[0] + t*v[0], p1[1] + t*v[1])
 
     @staticmethod
